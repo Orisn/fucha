@@ -139,7 +139,7 @@ export function AppSidebar({
         </div>
         <div className="min-w-0">
           <div className="truncate font-heading text-sm font-semibold tracking-tight">
-            Fucha
+           浮槎
           </div>
           <div className="truncate text-xs text-muted-foreground">
             the Star Raft

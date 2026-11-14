@@ -56,7 +56,7 @@ const MODES: { value: MdmMode; title: string; description: string }[] = [
     value: "background",
     title: "后台引擎（推荐）",
     description:
-      "MDM 不显示任何窗口，所有添加和进度都在 Fucha 里，不再有经典 Windows 弹窗。",
+      "MDM 不显示任何窗口，所有添加和进度都在浮槎里，不再有经典 Windows 弹窗。",
   },
   {
     value: "window",
@@ -237,7 +237,7 @@ export function SettingsDialog({
                   ))}
                 </RadioGroup>
                 <FieldDescription>
-                  后台模式由 Fucha 管理下载；关掉 Fucha 后 MDM
+                  后台模式由浮槎管理下载；关掉浮槎后 MDM
                   仍会继续运行。
                 </FieldDescription>
               </Field>

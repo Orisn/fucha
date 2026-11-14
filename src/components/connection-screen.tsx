@@ -56,7 +56,7 @@ export function ConnectionScreen({ error, onRetry }: ConnectionScreenProps) {
           </div>
           <CardTitle>连接 Mister Download Manager</CardTitle>
           <CardDescription>
-            Fucha 只是界面，下载由 MDM 的引擎完成。启动 MDM 并打开它的本地自动化
+            浮槎只是界面，下载由 MDM 的引擎完成。启动 MDM 并打开它的本地自动化
             API 即可连接。
           </CardDescription>
         </CardHeader>
