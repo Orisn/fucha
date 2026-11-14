@@ -1,5 +1,3 @@
-import { invoke } from "@tauri-apps/api/core";
-import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { mockCall } from "./mock";
 import type {
   ActAnswer,
@@ -12,20 +10,63 @@ import type { MdmMode } from "@/lib/studio-settings";
 export const isTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-const offlinePreview =
-  !isTauri &&
-  new URLSearchParams(window.location.search).get("offline") === "1";
+/** The local axum server; in dev Vite proxies relative `/api` to the same port. */
+const API_PORT = 8484;
+const API_ORIGIN = isTauri ? `http://127.0.0.1:${API_PORT}` : "";
+
+const params =
+  typeof window !== "undefined"
+    ? new URLSearchParams(window.location.search)
+    : new URLSearchParams();
+
+export const isMock = !isTauri && params.get("mock") === "1";
+const offlinePreview = !isTauri && params.get("offline") === "1";
+
+async function call<T>(path: string, init?: RequestInit): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${API_ORIGIN}${path}`, init);
+  } catch {
+    throw new Error(
+      `无法连接浮槎本地 API（127.0.0.1:${API_PORT}）。开发时请先运行 npm run api。`,
+    );
+  }
+
+  const text = await response.text();
+  let body: unknown = null;
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      if (response.ok) throw new Error(`API 返回了无法解析的内容：${text}`);
+    }
+  }
+
+  if (!response.ok) {
+    const message =
+      body && typeof body === "object" && "error" in body
+        ? String((body as { error: unknown }).error)
+        : `请求失败（HTTP ${response.status}）`;
+    throw new Error(message);
+  }
+  return body as T;
+}
+
+function post<T>(path: string, body: unknown): Promise<T> {
+  return call<T>(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
 
 async function request<T>(payload: Record<string, unknown>): Promise<T> {
-  if (!isTauri) {
-    if (offlinePreview && payload.query === "list") {
-      throw new Error("无法连接 MDM（预览模式）");
-    }
-    return mockCall(payload) as Promise<T>;
+  if (offlinePreview && payload.query === "list") {
+    throw new Error("无法连接 MDM（预览模式）");
   }
-  const answer = await invoke<Record<string, unknown>>("mdm_request", {
-    payload,
-  });
+  if (isMock) return mockCall(payload) as Promise<T>;
+
+  const answer = await post<Record<string, unknown>>("/api/mdm", payload);
   if (answer && typeof answer === "object" && "error" in answer) {
     throw new Error(String((answer as { error: unknown }).error));
   }
@@ -64,13 +105,13 @@ export function setQueue(
 }
 
 export async function ipcPath(): Promise<string> {
-  if (!isTauri) return "%APPDATA%\\misterdownloadmanager\\ipc.json";
-  return invoke<string>("mdm_ipc_path");
+  if (isMock) return "%APPDATA%\\misterdownloadmanager\\ipc.json";
+  return call<string>("/api/ipc-path");
 }
 
 export async function revealInFolder(path: string): Promise<void> {
-  if (!isTauri) throw new Error("浏览器预览模式无法打开文件夹");
-  await revealItemInDir(path);
+  if (isMock) throw new Error("模拟模式无法打开文件夹");
+  await post("/api/reveal", { path });
 }
 
 export async function openExternal(url: string): Promise<void> {
@@ -78,21 +119,36 @@ export async function openExternal(url: string): Promise<void> {
     window.open(url, "_blank", "noopener,noreferrer");
     return;
   }
-  await openUrl(url);
+  await post("/api/open", { url });
 }
 
 export async function readMdmDownloadDir(): Promise<string | null> {
-  if (!isTauri) return null;
-  return invoke<string | null>("mdm_download_dir");
+  if (isMock) return null;
+  return call<string | null>("/api/download-dir");
+}
+
+export async function systemDownloadDir(): Promise<string | null> {
+  if (isMock) return null;
+  return call<string | null>("/api/system-download-dir");
+}
+
+export async function pickDirectory(
+  defaultPath?: string,
+): Promise<string | null> {
+  if (isMock) return null;
+  const answer = await post<{ path: string | null }>("/api/pick-directory", {
+    defaultPath: defaultPath?.trim() || undefined,
+  });
+  return answer.path;
 }
 
 export async function applyMdmSettings(input: {
   mode: MdmMode;
   downloadDir: string;
 }): Promise<unknown> {
-  if (!isTauri) {
+  if (isMock) {
     await new Promise((resolve) => setTimeout(resolve, 500));
     return { ok: true, ...input };
   }
-  return invoke("mdm_apply_settings", input);
+  return post("/api/settings", input);
 }

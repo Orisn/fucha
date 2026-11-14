@@ -16,7 +16,7 @@ struct Endpoint {
 
 /// Where MDM keeps the port and token it listens on. Set `MDM_IPC_PATH` to point
 /// at another data folder (a portable copy, for instance).
-pub fn ipc_path() -> PathBuf {
+pub(crate) fn ipc_path() -> PathBuf {
     if let Some(path) = std::env::var_os("MDM_IPC_PATH") {
         return PathBuf::from(path);
     }
@@ -52,7 +52,7 @@ fn data_dir() -> PathBuf {
     }
 }
 
-async fn request_at(path: &Path, payload: &Value) -> Result<Value, String> {
+pub(crate) async fn request_at(path: &Path, payload: &Value) -> Result<Value, String> {
     let raw = tokio::fs::read_to_string(path)
         .await
         .map_err(|error| format!("读取 {} 失败：{error}", path.display()))?;
@@ -94,24 +94,11 @@ async fn request_at(path: &Path, payload: &Value) -> Result<Value, String> {
     }
 }
 
-#[tauri::command]
-pub async fn mdm_request(payload: Value) -> Result<Value, String> {
-    request_at(&ipc_path(), &payload).await
+fn ipc_dir(ipc: &Path) -> PathBuf {
+    ipc.parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
-#[tauri::command]
-pub fn mdm_ipc_path() -> String {
-    ipc_path().display().to_string()
-}
-
-fn ipc_dir() -> PathBuf {
-    ipc_path()
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default()
-}
-
-fn mdm_exe() -> Option<PathBuf> {
+fn mdm_exe(ipc: &Path) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("MDM_EXE") {
         let path = PathBuf::from(path);
         if path.is_file() {
@@ -119,7 +106,7 @@ fn mdm_exe() -> Option<PathBuf> {
         }
     }
 
-    let data = ipc_dir();
+    let data = ipc_dir(ipc);
     if data.file_name() == Some(std::ffi::OsStr::new("data"))
         && let Some(root) = data.parent()
     {
@@ -241,8 +228,8 @@ async fn stop_mdm(exe: &Path) -> Result<(), String> {
     Err("MDM 没有退出，请手动关闭它后再试。".into())
 }
 
-async fn current_port() -> Option<u16> {
-    let raw = tokio::fs::read_to_string(ipc_path()).await.ok()?;
+async fn current_port(ipc: &Path) -> Option<u16> {
+    let raw = tokio::fs::read_to_string(ipc).await.ok()?;
     let endpoint: Endpoint = serde_json::from_str(&raw).ok()?;
     Some(endpoint.port)
 }
@@ -257,17 +244,15 @@ async fn port_open(port: u16) -> bool {
     .unwrap_or(false)
 }
 
-async fn wait_ready(child: &mut std::process::Child) -> Result<(), String> {
+async fn wait_ready(ipc: &Path, child: &mut std::process::Child) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while tokio::time::Instant::now() < deadline {
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!("MDM 启动后立即退出（{status}）"));
         }
-        if let Some(port) = current_port().await
+        if let Some(port) = current_port(ipc).await
             && port_open(port).await
-            && request_at(&ipc_path(), &json!({ "query": "list" }))
-                .await
-                .is_ok()
+            && request_at(ipc, &json!({ "query": "list" })).await.is_ok()
         {
             return Ok(());
         }
@@ -301,9 +286,8 @@ fn start_command(
     Ok(command)
 }
 
-#[tauri::command]
-pub fn mdm_download_dir() -> Option<String> {
-    let raw = std::fs::read_to_string(ipc_dir().join("downloads.json")).ok()?;
+pub(crate) fn download_dir(ipc: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(ipc_dir(ipc).join("downloads.json")).ok()?;
     let root: Value = serde_json::from_str(&raw).ok()?;
     let entries = root.get("settings")?.get("category_dirs")?.as_array()?;
     entries
@@ -313,28 +297,31 @@ pub fn mdm_download_dir() -> Option<String> {
         .map(str::to_string)
 }
 
-#[tauri::command]
-pub async fn mdm_apply_settings(mode: String, download_dir: String) -> Result<Value, String> {
+pub(crate) async fn apply_settings(
+    ipc: &Path,
+    mode: &str,
+    download_dir: &str,
+) -> Result<Value, String> {
     let download_dir = download_dir.trim().to_string();
     if download_dir.is_empty() {
         return Err("请选择下载目录".into());
     }
     std::fs::create_dir_all(&download_dir).map_err(|error| format!("无法创建下载目录：{error}"))?;
 
-    let exe =
-        mdm_exe().ok_or("找不到 Mister Download Manager，请设置 MDM_EXE 环境变量指向它的程序。")?;
-    let data = ipc_dir();
+    let exe = mdm_exe(ipc)
+        .ok_or("找不到 Mister Download Manager，请设置 MDM_EXE 环境变量指向它的程序。")?;
+    let data = ipc_dir(ipc);
 
     stop_mdm(&exe).await?;
     set_general_dir(&data, &download_dir)?;
 
     let mut last_error = String::new();
     for attempt in 1..=2 {
-        let mut command = start_command(&exe, &data, &download_dir, &mode)?;
+        let mut command = start_command(&exe, &data, &download_dir, mode)?;
         let mut child = command
             .spawn()
             .map_err(|error| format!("启动 MDM 失败：{error}"))?;
-        match wait_ready(&mut child).await {
+        match wait_ready(ipc, &mut child).await {
             Ok(()) => {
                 return Ok(json!({ "mode": mode, "downloadDir": download_dir }));
             }

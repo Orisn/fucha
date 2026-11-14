@@ -5,8 +5,8 @@
 用 Tauri 2 + React 19 + shadcn/ui 做的 [Mister Download Manager](https://github.com/anefzaoui/misterdownloadmanager) 前端。
 
 浮槎只负责界面：下载、分段、断点续传、浏览器接管和种子都由本机的
-Mister Download Manager 完成。两者通过 MDM 的本地自动化 API 通信（`127.0.0.1`
-上的一行 JSON 协议）。
+Mister Download Manager 完成。浮槎内置一个只监听 `127.0.0.1:8484` 的
+axum 服务：前端通过 HTTP 调它，它再用 MDM 的一行 JSON 协议调 MDM。
 
 「浮槎」是每年八月准时往返于大海与天河之间的木筏，从不误期。
 Slogan：**年年八月，不失期。** / *Every August, without fail.*
@@ -23,7 +23,31 @@ Slogan：**年年八月，不失期。** / *Every August, without fail.*
 ```bash
 cd fucha
 npm install
+```
+
+桌面应用（axum 由 Tauri 在启动时拉起）：
+
+```bash
 npm run tauri dev
+```
+
+浏览器开发（Vite + 独立的 axum 进程）：
+
+```bash
+npm run dev
+```
+
+`npm run dev` 会同时启动 Vite（1420）和 `fucha-server`（`127.0.0.1:8484`）。
+浏览器里的 `/api` 请求由 Vite 代理到 axum；打包后前端直接访问同一端口。
+
+也可以分开跑：
+
+```bash
+npm run dev:web
+```
+
+```bash
+npm run api
 ```
 
 第一次使用前，启动 MDM 并打开自动化 API（只需一次）：
@@ -38,12 +62,9 @@ MDM 每次启动会把端口和 token 写进
 
 ### 没有 MDM 也能看界面
 
-```bash
-npm run dev
-```
-
-浏览器里会使用内置的模拟数据（`src/lib/mdm/mock.ts`），列表会自动跑进度，可以完整点一遍交互。
-加 `?offline=1` 可以预览「未连接 MDM」的引导页。
+打开 `http://localhost:1420/?mock=1`，前端会使用内置的模拟数据
+（`src/lib/mdm/mock.ts`），列表会自动跑进度，可以完整点一遍交互。
+不加参数时会走真实的本地 API。`?offline=1` 可以预览「未连接 MDM」的引导页。
 
 ## 设置
 
@@ -78,11 +99,33 @@ npm run tauri build -- --no-bundle
 
 | 路径 | 作用 |
 |---|---|
-| `src-tauri/src/mdm.rs` | Rust 端：读 `ipc.json`、加 token、走本地 TCP 调自动化 API；设置页的启动/重启逻辑 |
-| `src/lib/mdm/client.ts` | 前端传输层：Tauri 里走 `invoke`，浏览器里走 mock |
+| `src-tauri/src/api.rs` | axum 路由：`/api/mdm` 透传 MDM 协议，另有设置、选目录、打开链接等本机操作 |
+| `src-tauri/src/mdm.rs` | 读写 MDM 的 `ipc.json`、走本地 TCP 调自动化 API；设置页的启动/重启逻辑 |
+| `src-tauri/src/bin/fucha-server.rs` | 浏览器开发用的独立 API 进程 |
+| `src/lib/mdm/client.ts` | 前端传输层：统一 `fetch` 本地 API，`?mock=1` 时走模拟数据 |
 | `src/hooks/use-mdm.ts` | 每秒轮询下载列表 |
 | `src/App.tsx` | 布局、筛选、批量操作 |
 | `src/components/` | 品牌标识、侧栏、下载表格、统计卡片、添加/设置对话框 |
+
+本地 API 只监听 `127.0.0.1:8484`：
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| `GET` | `/api/health` | 存活检查 |
+| `POST` | `/api/mdm` | 把 JSON 原样发给 MDM（单行协议），返回 MDM 的回复 |
+| `GET` | `/api/ipc-path` | 当前使用的 `ipc.json` 路径 |
+| `GET` | `/api/download-dir` | MDM 的 General 分类下载目录 |
+| `GET` | `/api/system-download-dir` | 系统默认下载目录 |
+| `POST` | `/api/settings` | 保存下载目录和运行方式，重启 MDM |
+| `POST` | `/api/pick-directory` | 打开原生文件夹选择器 |
+| `POST` | `/api/open` | 用默认浏览器打开 http/https 链接 |
+| `POST` | `/api/reveal` | 在资源管理器中定位文件 |
+
+例如：
+
+```bash
+curl -X POST http://127.0.0.1:8484/api/mdm -H "content-type: application/json" -d "{\"query\":\"list\"}"
+```
 
 ## 当前边界
 

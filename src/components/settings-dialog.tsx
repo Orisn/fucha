@@ -1,7 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { toast } from "sonner";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { downloadDir as systemDownloadDir } from "@tauri-apps/api/path";
 import { cn } from "cn";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
@@ -35,8 +33,10 @@ import { Spinner } from "@/components/ui/spinner";
 import { CircleAlertIcon, FolderOpenIcon } from "lucide-react";
 import {
   applyMdmSettings,
-  isTauri,
+  isMock,
+  pickDirectory,
   readMdmDownloadDir,
+  systemDownloadDir,
 } from "@/lib/mdm/client";
 import { useStudioSettings, type MdmMode } from "@/lib/studio-settings";
 
@@ -98,9 +98,9 @@ export function SettingsDialog({
       }
       try {
         const fallback = await systemDownloadDir();
-        if (!cancelled) setDir(fallback);
+        if (!cancelled && fallback) setDir(fallback);
       } catch {
-        // Browser preview: no Tauri path API.
+        // The local API is unreachable; leave the field empty.
       }
     })();
     return () => {
@@ -109,18 +109,14 @@ export function SettingsDialog({
   }, [open, settings.downloadDir, settings.mode]);
 
   async function pickFolder() {
-    if (!isTauri) {
-      toast.info("浏览器预览模式不能打开文件夹选择器，请直接输入路径。");
+    if (isMock) {
+      toast.info("模拟模式不能打开文件夹选择器，请直接输入路径。");
       return;
     }
     setPicking(true);
     try {
-      const selected = await openDialog({
-        directory: true,
-        multiple: false,
-        defaultPath: dir.trim() || undefined,
-      });
-      if (typeof selected === "string") setDir(selected);
+      const selected = await pickDirectory(dir.trim() || undefined);
+      if (selected) setDir(selected);
     } catch (cause) {
       toast.error("无法选择文件夹", { description: messageOf(cause) });
     } finally {
