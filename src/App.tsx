@@ -33,12 +33,14 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { AddDownloadDialog } from "@/components/add-download-dialog";
 import { AppSidebar } from "@/components/app-sidebar";
+import { BrowserIntegrationAlert } from "@/components/browser-integration";
 import { ConnectionScreen } from "@/components/connection-screen";
 import { DeleteDialog } from "@/components/delete-dialog";
 import { DownloadTable } from "@/components/download-table";
 import { SettingsDialog } from "@/components/settings-dialog";
 import { StatsCards } from "@/components/stats-cards";
 import { STATUS_LABELS } from "@/components/status-badge";
+import { useBrowserIntegration } from "@/hooks/use-browser-integration";
 import { useMdm } from "@/hooks/use-mdm";
 import {
   act,
@@ -59,17 +61,23 @@ const ACTION_LABELS: Record<DownloadAction, string> = {
   delete: "已删除文件",
 };
 
+const BROWSER_GUIDE_KEY = "fucha.browser-guide.dismissed";
+
 function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
 export default function App() {
   const { data, error, connected, refresh } = useMdm();
+  const { integration, refresh: refreshIntegration } = useBrowserIntegration();
   const [filter, setFilter] = useState<Filter>({ kind: "all" });
   const [search, setSearch] = useState("");
   const [addOpen, setAddOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<DownloadInfo | null>(null);
+  const [browserGuideDismissed, setBrowserGuideDismissed] = useState(
+    () => localStorage.getItem(BROWSER_GUIDE_KEY) === "1",
+  );
 
   const downloads = data?.downloads ?? [];
 
@@ -267,6 +275,16 @@ export default function App() {
             </Alert>
           )}
 
+          {connected && !browserGuideDismissed && (
+            <BrowserIntegrationAlert
+              integration={integration}
+              onDismiss={() => {
+                localStorage.setItem(BROWSER_GUIDE_KEY, "1");
+                setBrowserGuideDismissed(true);
+              }}
+            />
+          )}
+
           <StatsCards data={data} />
 
           <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border bg-card">
@@ -337,6 +355,8 @@ export default function App() {
         onOpenChange={setSettingsOpen}
         activeCount={activeCount}
         onSaved={() => void refresh()}
+        integration={integration}
+        onRefreshIntegration={() => void refreshIntegration()}
       />
     </div>
   );

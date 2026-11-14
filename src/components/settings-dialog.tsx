@@ -31,6 +31,7 @@ import { Input } from "@/components/ui/input";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Spinner } from "@/components/ui/spinner";
 import { CircleAlertIcon, FolderOpenIcon } from "lucide-react";
+import { BrowserIntegrationSection } from "@/components/browser-integration";
 import {
   applyMdmSettings,
   isMock,
@@ -39,12 +40,15 @@ import {
   systemDownloadDir,
 } from "@/lib/mdm/client";
 import { useStudioSettings, type MdmMode } from "@/lib/studio-settings";
+import type { BrowserIntegration } from "@/lib/mdm/types";
 
 interface SettingsDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   activeCount: number;
   onSaved: () => void;
+  integration: BrowserIntegration | null;
+  onRefreshIntegration: () => void;
 }
 
 function messageOf(cause: unknown): string {
@@ -71,6 +75,8 @@ export function SettingsDialog({
   onOpenChange,
   activeCount,
   onSaved,
+  integration,
+  onRefreshIntegration,
 }: SettingsDialogProps) {
   const { settings, save } = useStudioSettings();
   const [dir, setDir] = useState(settings.downloadDir);
@@ -166,7 +172,7 @@ export function SettingsDialog({
           <DialogHeader>
             <DialogTitle>设置</DialogTitle>
             <DialogDescription>
-              下载目录和 MDM 的运行方式。保存会重启 MDM。
+              下载目录、MDM 的运行方式和浏览器接管。保存会重启 MDM。
             </DialogDescription>
           </DialogHeader>
 
@@ -237,6 +243,11 @@ export function SettingsDialog({
                   仍会继续运行。
                 </FieldDescription>
               </Field>
+
+              <BrowserIntegrationSection
+                integration={integration}
+                onRefresh={onRefreshIntegration}
+              />
 
               {activeCount > 0 && (
                 <Alert>

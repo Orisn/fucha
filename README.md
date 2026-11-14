@@ -76,6 +76,9 @@ MDM 每次启动会把端口和 token 写进
   - **后台引擎（推荐）**：以 `--headless --downloads <目录>` 运行。MDM 不显示任何窗口，
     也没有经典下载弹窗，添加/进度全部在浮槎里。
   - **MDM 窗口**：保留 MDM 自己的主窗口、设置和下载弹窗，在托盘运行。
+- **浏览器接管**：显示 MDM 是否已经见过某个浏览器的扩展（读取 MDM 的
+  `extension-seen`），并给出 Chrome / Edge 和 Firefox 的安装入口。浏览器扩展由
+  MDM 提供、由 MDM 自己维护，不是浮槎的一部分。
 
 保存会重启 MDM，进行中的下载会中断，之后可以继续。MDM 的安装路径默认从
 `%LOCALAPPDATA%\Programs\Mister Download Manager` 查找，其他位置可以用环境变量
@@ -116,6 +119,7 @@ npm run tauri build -- --no-bundle
 | `GET` | `/api/ipc-path` | 当前使用的 `ipc.json` 路径 |
 | `GET` | `/api/download-dir` | MDM 的 General 分类下载目录 |
 | `GET` | `/api/system-download-dir` | 系统默认下载目录 |
+| `GET` | `/api/browser-integration` | MDM 是否见过浏览器扩展（`extension-seen`） |
 | `POST` | `/api/settings` | 保存下载目录和运行方式，重启 MDM |
 | `POST` | `/api/pick-directory` | 打开原生文件夹选择器 |
 | `POST` | `/api/open` | 用默认浏览器打开 http/https 链接 |

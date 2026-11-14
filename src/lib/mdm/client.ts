@@ -2,6 +2,7 @@ import { mockCall } from "./mock";
 import type {
   ActAnswer,
   AddInput,
+  BrowserIntegration,
   DownloadAction,
   MdmList,
 } from "./types";
@@ -130,6 +131,11 @@ export async function readMdmDownloadDir(): Promise<string | null> {
 export async function systemDownloadDir(): Promise<string | null> {
   if (isMock) return null;
   return call<string | null>("/api/system-download-dir");
+}
+
+export async function browserIntegration(): Promise<BrowserIntegration> {
+  if (isMock) return { seen: false, browsers: [] };
+  return call<BrowserIntegration>("/api/browser-integration");
 }
 
 export async function pickDirectory(

@@ -25,6 +25,7 @@ pub(crate) fn router(ipc: PathBuf) -> Router {
         .route("/api/ipc-path", get(ipc_path))
         .route("/api/download-dir", get(download_dir))
         .route("/api/system-download-dir", get(system_download_dir))
+        .route("/api/browser-integration", get(browser_integration))
         .route("/api/settings", post(settings))
         .route("/api/pick-directory", post(pick_directory))
         .route("/api/open", post(open))
@@ -54,6 +55,10 @@ async fn ipc_path(State(state): State<AppState>) -> Json<Value> {
 
 async fn download_dir(State(state): State<AppState>) -> Json<Value> {
     Json(json!(mdm::download_dir(&state.ipc)))
+}
+
+async fn browser_integration(State(state): State<AppState>) -> Json<Value> {
+    Json(mdm::browser_integration(&state.ipc))
 }
 
 async fn system_download_dir() -> Json<Value> {
@@ -225,6 +230,57 @@ mod tests {
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let answer: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(answer["downloads"], json!([]));
+
+        let _ = std::fs::remove_dir_all(ipc.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn browser_integration_reads_the_browsers_mdm_has_seen() {
+        let ipc = endpoint_file(1);
+        std::fs::write(
+            ipc.parent().unwrap().join("extension-seen"),
+            "Microsoft Edge\t0.5.2\nFirefox\t0.5.2\n",
+        )
+        .unwrap();
+
+        let response = router(ipc.clone())
+            .oneshot(
+                Request::get("/api/browser-integration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let answer: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["seen"], json!(true));
+        assert_eq!(answer["browsers"][0]["name"], json!("Microsoft Edge"));
+        assert_eq!(answer["browsers"][0]["version"], json!("0.5.2"));
+        assert_eq!(answer["browsers"][1]["name"], json!("Firefox"));
+
+        let _ = std::fs::remove_dir_all(ipc.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn browser_integration_is_not_seen_without_the_file() {
+        let ipc = endpoint_file(1);
+
+        let response = router(ipc.clone())
+            .oneshot(
+                Request::get("/api/browser-integration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let answer: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["seen"], json!(false));
+        assert_eq!(answer["browsers"], json!([]));
 
         let _ = std::fs::remove_dir_all(ipc.parent().unwrap());
     }

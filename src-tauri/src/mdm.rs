@@ -286,6 +286,25 @@ fn start_command(
     Ok(command)
 }
 
+/// Which browsers have started the extension's native host: MDM records one
+/// `browser\tversion` line in `extension-seen` each time one reaches it.
+pub(crate) fn browser_integration(ipc: &Path) -> Value {
+    let file = ipc_dir(ipc).join("extension-seen");
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    let browsers: Vec<Value> = text
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let (name, version) = line.split_once('\t').unwrap_or((line, ""));
+            Some(json!({ "name": name, "version": version }))
+        })
+        .collect();
+    json!({ "seen": !browsers.is_empty(), "browsers": browsers })
+}
+
 pub(crate) fn download_dir(ipc: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(ipc_dir(ipc).join("downloads.json")).ok()?;
     let root: Value = serde_json::from_str(&raw).ok()?;

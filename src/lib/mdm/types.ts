@@ -53,6 +53,11 @@ export interface AddInput {
   later?: boolean;
 }
 
+export interface BrowserIntegration {
+  seen: boolean;
+  browsers: { name: string; version: string }[];
+}
+
 export type Filter =
   | { kind: "all" }
   | { kind: "status"; status: DownloadStatus }
