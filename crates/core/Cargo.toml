@@ -17,6 +17,7 @@ mdm-ipc.workspace = true
 mdm-platform.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 url.workspace = true
 # RSS feeds (rss.rs): reading them (no DTDs), and the rules' regular expressions; both already
 # in the tree (resvg's SVG, the engine's dependencies).

@@ -2,9 +2,9 @@
 //! shortly before a queue's start time, and kept awake while that queue runs.
 //!
 //! The times are worked out here, the same on every system; the waking itself is the system's:
-//! - Windows: a waitable timer that resumes the computer (`win32::wake_at`), owned by MDM's
-//!   process, as the Scheduler's starts are (MDM has to be running, in the tray if need be).
-//!   Windows' power options must allow wake timers; when they don't, the Scheduler says so.
+//! - Windows: a waitable timer that resumes the computer (`mdm_platform::wake_at`), owned by
+//!   MDM's process, as the Scheduler's starts are (MDM has to be running, in the tray if need
+//!   be). Windows' power options must allow wake timers; when they don't, the Scheduler says so.
 //! - Linux: the clock chip's wake alarm (`/sys/class/rtc/rtc0/wakealarm`), which only an
 //!   administrator may set unless they let users set it (the guide shows how). A systemd user
 //!   timer can't wake the system (`WakeSystem=` needs the system manager), nor can `rtcwake`
@@ -27,34 +27,7 @@ use crate::queue::{Queue, Schedule};
 /// The computer is woken this long before the start, so the network is back by then.
 pub const LEAD: Duration = Duration::seconds(60);
 
-/// Whether this computer can be woken by MDM, and if not, why.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Support {
-    // macOS never can (see unix::wake_support).
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    Ready,
-    /// Windows' power options don't allow wake timers now (on battery: `battery`).
-    TimersOff { battery: bool },
-    /// Windows allows wake timers on mains power only, and this computer has a battery.
-    NotOnBattery,
-    /// Linux: the wake alarm is the administrator's (the guide shows how to allow it).
-    NeedsAdmin,
-    /// Linux: no clock chip with a wake alarm.
-    NoAlarm,
-    /// macOS: only an administrator can schedule a wake.
-    MacAdmin,
-}
-
-impl Support {
-    /// The checkbox can be ticked: waking is possible here, or becomes so in the system's own
-    /// settings without an administrator (Windows' wake timers are a power option).
-    pub fn can_tick(&self) -> bool {
-        matches!(
-            self,
-            Support::Ready | Support::TimersOff { .. } | Support::NotOnBattery
-        )
-    }
-}
+pub use mdm_platform::Support;
 
 /// When `s` next starts after `now` (local time): its "Once at" date at the start time, or
 /// the next ticked weekday's. None without a start time, or when it can never come.
@@ -135,7 +108,7 @@ pub fn support() -> Support {
 /// (`timers-off`, `battery-off`, `not-on-battery`, `needs-admin`, `no-alarm`, `mac-admin`), so
 /// every state of the Scheduler's line can be shown and checked on one computer.
 fn test_support() -> Option<Support> {
-    if !crate::offscreen() {
+    if !mdm_platform::offscreen() {
         return None;
     }
     Some(match std::env::var("MDM_TEST_WAKE").ok()?.as_str() {
@@ -149,25 +122,8 @@ fn test_support() -> Option<Support> {
     })
 }
 
-#[cfg(windows)]
 fn ask_support() -> Support {
-    // 0 off, 1 on, 2 "important wake timers only" (Windows' own, not an app's).
-    let w = crate::win32::wake_timers();
-    let now = if w.on_battery { w.dc } else { w.ac };
-    if now != 1 {
-        Support::TimersOff {
-            battery: w.on_battery,
-        }
-    } else if w.has_battery && w.dc != 1 {
-        Support::NotOnBattery
-    } else {
-        Support::Ready
-    }
-}
-
-#[cfg(unix)]
-fn ask_support() -> Support {
-    crate::unix::wake_support()
+    mdm_platform::wake_support()
 }
 
 /// What the app keeps: the wake asked of the system, and whether it keeps the computer awake.
@@ -464,26 +420,28 @@ impl Holder {
 
 /// Set the system's wake for `at` (UTC), or cancel it (None).
 fn arm(at: Option<(DateTime<Utc>, &str)>) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        crate::win32::wake_at(at.map(|(t, q)| (t.timestamp(), q)))
-    }
-    #[cfg(unix)]
-    {
-        crate::unix::wake_at(at.map(|(t, _)| t.timestamp()))
-    }
+    let (at, queue) = match at {
+        Some((t, q)) => (Some(t.timestamp()), q),
+        None => (None, ""),
+    };
+    mdm_platform::wake_at(at, queue).map_err(|e| match e {
+        mdm_platform::WakeError::NotSupported => crate::i18n::t(
+            // i18n: the Scheduler, under "Wake the computer to run this queue": Windows set the timer but can't wake this computer with it
+            "This computer can't be woken by a timer",
+        )
+        .to_owned(),
+        mdm_platform::WakeError::AlarmTaken => crate::i18n::t(
+            // i18n: the Scheduler, under "Wake the computer to run this queue" (Linux): the computer's one wake alarm is already set by something else
+            "Another program has set the computer's wake alarm",
+        )
+        .to_owned(),
+        mdm_platform::WakeError::Message(message) => message,
+    })
 }
 
 /// Keep the computer awake (`reason`) or let it sleep (None); false when the system refused.
 fn hold_awake(reason: Option<&str>) -> bool {
-    #[cfg(windows)]
-    {
-        crate::win32::keep_awake(reason)
-    }
-    #[cfg(unix)]
-    {
-        crate::unix::keep_awake(reason)
-    }
+    mdm_platform::keep_awake(reason)
 }
 
 #[cfg(test)]

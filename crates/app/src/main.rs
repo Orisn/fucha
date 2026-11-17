@@ -63,7 +63,7 @@ mod tray;
 mod unix;
 mod update;
 mod videodlg;
-mod wake;
+pub use mdm_core::wake;
 mod whereis;
 #[cfg(windows)]
 mod win32;

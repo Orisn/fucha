@@ -10,9 +10,15 @@ publish.workspace = true
 
 [dependencies]
 serde.workspace = true
+tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+chrono.workspace = true
+mdm-ipc.workspace = true
+zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
 
 [lints]
 workspace = true

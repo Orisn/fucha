@@ -5028,6 +5028,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
  "url",
 ]
 
@@ -5207,8 +5208,12 @@ dependencies = [
 name = "mdm-platform"
 version = "0.5.2"
 dependencies = [
+ "chrono",
+ "mdm-ipc",
  "serde",
+ "tracing",
  "windows-sys 0.61.2",
+ "zbus",
 ]
 
 [[package]]
