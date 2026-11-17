@@ -15,6 +15,10 @@ chrono.workspace = true
 dirs.workspace = true
 mdm-ipc.workspace = true
 mdm-platform.workspace = true
+# The types kept with a download: what it learnt of its server (whereis::Seen, from the engine)
+# and a torrent's spec (torrent_spec::TorrentSpec, with librqbit's piece order).
+mdm-engine.workspace = true
+mdm-torrent.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

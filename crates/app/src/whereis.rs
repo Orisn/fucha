@@ -9,33 +9,10 @@ use std::net::IpAddr;
 use std::sync::OnceLock;
 
 use egui::{Color32, Rect, Sense, Ui, pos2, vec2};
-use serde::{Deserialize, Serialize};
 
 use crate::winui;
 
-/// What a download learnt of its server, kept with it (Properties shows it after it ends).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Seen {
-    #[serde(default)]
-    pub ip: Option<IpAddr>,
-    #[serde(default)]
-    pub rtt_ms: Option<u32>,
-    #[serde(default)]
-    pub proxied: bool,
-    #[serde(default)]
-    pub cdn: Option<String>,
-}
-
-impl From<&mdm_engine::Server> for Seen {
-    fn from(s: &mdm_engine::Server) -> Self {
-        Seen {
-            ip: s.ip,
-            rtt_ms: s.rtt.map(|d| d.as_millis().min(u32::MAX as u128) as u32),
-            proxied: s.proxied,
-            cdn: s.cdn.map(str::to_owned),
-        }
-    }
-}
+pub use mdm_core::whereis::Seen;
 
 /// How far the server is, by its round trip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,23 +292,5 @@ mod tests {
         assert_eq!(reach(149), Reach::Medium);
         assert_eq!(reach(150), Reach::Far);
         assert_eq!(reach(900), Reach::Far);
-    }
-
-    #[test]
-    fn what_was_seen_is_kept_in_milliseconds() {
-        let s = mdm_engine::Server {
-            ip: Some("8.8.8.8".parse().unwrap()),
-            rtt: Some(std::time::Duration::from_micros(23_400)),
-            proxied: false,
-            cdn: Some("Cloudflare"),
-        };
-        let seen = Seen::from(&s);
-        assert_eq!(seen.rtt_ms, Some(23));
-        assert_eq!(seen.cdn.as_deref(), Some("Cloudflare"));
-        let back: Seen = serde_json::from_str(&serde_json::to_string(&seen).unwrap()).unwrap();
-        assert_eq!(back, seen);
-        // Kept from before: nothing.
-        let old: Seen = serde_json::from_str("{}").unwrap();
-        assert_eq!(old, Seen::default());
     }
 }

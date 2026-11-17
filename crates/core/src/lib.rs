@@ -10,4 +10,6 @@ pub mod queue;
 pub mod quota;
 pub mod regional;
 pub mod rss;
+pub mod torrent_spec;
 pub mod wake;
+pub mod whereis;
