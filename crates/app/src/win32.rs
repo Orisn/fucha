@@ -2369,12 +2369,6 @@ mod install_language_tests {
     }
 }
 
-/// `t` (local time) as the user's Windows region writes a short date and a time with seconds
-/// (Control Panel → Region): `30/10/2026 00:38:09`, `2026/10/30 0:38:09`… None if Windows can't.
-pub fn local_date_time(t: chrono::NaiveDateTime) -> Option<String> {
-    mdm_platform::local_date_time(t)
-}
-
 /// Windows' edition, release and build, e.g. "Windows 11 Pro 24H2 (build 26200)" — for problem
 /// reports. ProductName still says "Windows 10" on 11; the build tells them apart.
 pub fn windows_version() -> String {

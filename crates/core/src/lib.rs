@@ -4,7 +4,9 @@
 //! may depend on egui or on a window.
 
 pub mod countries;
+pub mod errors;
 pub mod i18n;
+pub mod model;
 pub mod paths;
 pub mod queue;
 pub mod quota;

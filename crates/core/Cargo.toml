@@ -16,10 +16,13 @@ dirs.workspace = true
 mdm-engine.workspace = true
 mdm-ipc.workspace = true
 mdm-platform.workspace = true
-# The types kept with a download: what it learnt of its server (whereis::Seen, from the engine)
-# and a torrent's spec (torrent_spec::TorrentSpec, with librqbit's piece order).
-mdm-engine.workspace = true
+# A torrent's spec (torrent_spec::TorrentSpec, with librqbit's piece order).
 mdm-torrent.workspace = true
+# The downloads the list keeps: video pages (yt-dlp) and galleries, and a torrent sent to a
+# debrid account.
+mdm-tools.workspace = true
+mdm-debrid.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

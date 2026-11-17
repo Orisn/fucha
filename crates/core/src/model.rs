@@ -322,7 +322,7 @@ pub fn category_folder(cat: Category, downloads: &Path, dirs: &[(String, String)
     dirs.iter()
         .find(|(c, _)| *c == *key)
         // A folder may be saved as shown, relative to the user's home.
-        .map(|(_, d)| crate::dialogs::resolve_path(d))
+        .map(|(_, d)| crate::paths::resolve_path(d))
         .unwrap_or_else(|| cat.folder(downloads))
 }
 
@@ -368,7 +368,7 @@ pub struct Item {
     pub video: Option<VideoSpec>,
     /// A torrent or magnet (M15): its `url` is a magnet link, `dest` its folder or one file.
     #[serde(default)]
-    pub torrent: Option<crate::torrents::TorrentSpec>,
+    pub torrent: Option<crate::torrent_spec::TorrentSpec>,
     /// An image gallery downloaded by gallery-dl (#58): its `url` is the gallery's page, `dest`
     /// the folder its files go into.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -446,7 +446,7 @@ pub enum Job {
     },
     /// A torrent: the app's librqbit session runs it, behind core's handle so this model can
     /// move to mdm-core.
-    Torrent(Box<dyn mdm_core::torrent::TorrentHandle>),
+    Torrent(Box<dyn crate::torrent::TorrentHandle>),
     /// A torrent through a debrid account, then its files over HTTP (#44).
     Remote(mdm_debrid::torrents::RemoteTorrent),
 }
@@ -818,14 +818,7 @@ impl Item {
                         .collect();
                     let side = done.side_files;
                     for f in s.file.iter().chain(side.iter()) {
-                        #[cfg(windows)]
-                        crate::win32::mark_downloaded(
-                            f,
-                            url.as_str(),
-                            self.context.referer.as_deref(),
-                        );
-                        #[cfg(unix)]
-                        crate::unix::mark_downloaded(
+                        mdm_platform::mark_downloaded(
                             f,
                             url.as_str(),
                             self.context.referer.as_deref(),
@@ -841,10 +834,7 @@ impl Item {
                     && matches!(url.scheme(), "http" | "https")
                 {
                     for f in &job.saved() {
-                        #[cfg(windows)]
-                        crate::win32::mark_downloaded(f, url.as_str(), None);
-                        #[cfg(unix)]
-                        crate::unix::mark_downloaded(f, url.as_str(), None);
+                        mdm_platform::mark_downloaded(f, url.as_str(), None);
                     }
                 }
                 for n in &notices {
@@ -1004,7 +994,7 @@ pub fn when_text(t: chrono::NaiveDateTime) -> String {
         return stamp_text(t, formats.clock24);
     }
     #[cfg(windows)]
-    if let Some(s) = crate::win32::local_date_time(t) {
+    if let Some(s) = mdm_platform::local_date_time(t) {
         return crate::i18n::ltr(&s);
     }
     crate::i18n::ltr(&crate::regional::short_date_time(t))
