@@ -36,6 +36,8 @@ mdm-engine.workspace = true
 mdm-extract.workspace = true
 mdm-geo.workspace = true
 mdm-ipc.workspace = true
+# The OS layer's Mark-of-the-Web and local date/time (win32.rs, unix.rs wrappers).
+mdm-platform.workspace = true
 # The remote control (#141): a paired phone adds and controls downloads over the local network.
 mdm-remote.workspace = true
 mdm-tools.workspace = true

@@ -4960,6 +4960,7 @@ dependencies = [
  "mdm-geo",
  "mdm-ipc",
  "mdm-labserver",
+ "mdm-platform",
  "mdm-remote",
  "mdm-tools",
  "mdm-torrent",
@@ -5209,6 +5210,7 @@ name = "mdm-platform"
 version = "0.5.2"
 dependencies = [
  "chrono",
+ "libc",
  "mdm-ipc",
  "serde",
  "tracing",

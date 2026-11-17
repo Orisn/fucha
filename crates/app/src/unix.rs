@@ -1837,64 +1837,10 @@ pub fn open_in(program: &Path, url: &str) {
 
 /// The counterpart of win32's Mark-of-the-Web on a file being downloaded from `url`: macOS'
 /// quarantine attribute (Gatekeeper checks a program before its first start, as for a browser's
-/// download), and on Linux the freedesktop.org origin attributes file managers show.
+/// download), and on Linux the freedesktop.org origin attributes file managers show
+/// (`mdm_platform::mark_downloaded`).
 pub fn mark_downloaded(path: &Path, url: &str, referrer: Option<&str>) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = referrer;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        set_xattr(
-            path,
-            "com.apple.quarantine",
-            &format!("0081;{now:x};Mister Download Manager;"),
-        );
-        let _ = url;
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        set_xattr(path, "user.xdg.origin.url", url);
-        if let Some(r) = referrer.filter(|r| r.starts_with("http")) {
-            set_xattr(path, "user.xdg.referrer.url", r);
-        }
-    }
-}
-
-/// One extended attribute; a file system without them is left as it is.
-#[allow(unsafe_code)]
-fn set_xattr(path: &Path, name: &str, value: &str) {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let (Ok(p), Ok(n)) = (
-        CString::new(path.as_os_str().as_bytes()),
-        CString::new(name),
-    ) else {
-        return;
-    };
-    // SAFETY: both strings are NUL-terminated and live through the call; the value is a byte
-    // slice with its length.
-    #[cfg(target_os = "macos")]
-    let _ = unsafe {
-        libc::setxattr(
-            p.as_ptr(),
-            n.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-            0,
-        )
-    };
-    #[cfg(not(target_os = "macos"))]
-    let _ = unsafe {
-        libc::setxattr(
-            p.as_ptr(),
-            n.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-        )
-    };
+    mdm_platform::mark_downloaded(path, url, referrer);
 }
 
 #[cfg(all(test, target_os = "linux"))]

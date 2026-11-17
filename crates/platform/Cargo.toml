@@ -9,6 +9,7 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+chrono.workspace = true
 serde.workspace = true
 tracing.workspace = true
 
@@ -16,9 +17,12 @@ tracing.workspace = true
 windows-sys.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-chrono.workspace = true
 mdm-ipc.workspace = true
 zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
+
+# Marking a downloaded file (macOS' quarantine, Linux's origin attributes).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
 
 [lints]
 workspace = true

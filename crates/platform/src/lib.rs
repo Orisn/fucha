@@ -62,6 +62,143 @@ pub fn offscreen() -> bool {
     *ON.get_or_init(|| std::env::var_os("MDM_OFFSCREEN").is_some_and(|v| v == "1"))
 }
 
+/// Mark-of-the-Web on a file being downloaded from `url` (`referrer`'s page): the zone stream
+/// browsers write, so SmartScreen checks a program, Office opens a document in Protected View and
+/// archive tools pass the mark on, as for the browser's own download. Written on the part file
+/// as it is created (the engine renames it, the stream going along).
+#[cfg(windows)]
+pub fn mark_downloaded(path: &std::path::Path, url: &str, referrer: Option<&str>) {
+    // Only addresses from the web: never a login's password (the engine has none in `url`).
+    let clean = |u: &str| u.split(['\r', '\n']).next().unwrap_or("").to_owned();
+    let mut text = String::from("[ZoneTransfer]\r\nZoneId=3\r\n");
+    if let Some(r) = referrer.filter(|r| r.starts_with("http")) {
+        text.push_str(&format!("ReferrerUrl={}\r\n", clean(r)));
+    }
+    text.push_str(&format!("HostUrl={}\r\n", clean(url)));
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    let _ = std::fs::write(stream, text);
+}
+
+/// The counterpart of Windows' Mark-of-the-Web on a file being downloaded from `url`: macOS'
+/// quarantine attribute (Gatekeeper checks a program before its first start, as for a browser's
+/// download), and on Linux the freedesktop.org origin attributes file managers show.
+#[cfg(not(windows))]
+pub fn mark_downloaded(path: &std::path::Path, url: &str, referrer: Option<&str>) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = referrer;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        set_xattr(
+            path,
+            "com.apple.quarantine",
+            &format!("0081;{now:x};Mister Download Manager;"),
+        );
+        let _ = url;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        set_xattr(path, "user.xdg.origin.url", url);
+        if let Some(r) = referrer.filter(|r| r.starts_with("http")) {
+            set_xattr(path, "user.xdg.referrer.url", r);
+        }
+    }
+}
+
+/// One extended attribute; a file system without them is left as it is.
+#[cfg(not(windows))]
+fn set_xattr(path: &std::path::Path, name: &str, value: &str) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let (Ok(p), Ok(n)) = (
+        CString::new(path.as_os_str().as_bytes()),
+        CString::new(name),
+    ) else {
+        return;
+    };
+    // SAFETY: both strings are NUL-terminated and live through the call; the value is a byte
+    // slice with its length.
+    #[cfg(target_os = "macos")]
+    let _ = unsafe {
+        libc::setxattr(
+            p.as_ptr(),
+            n.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _ = unsafe {
+        libc::setxattr(
+            p.as_ptr(),
+            n.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+}
+
+/// `t` (local time) as the user's Windows region writes a short date and a time with seconds
+/// (Control Panel → Region): `30/10/2026 00:38:09`, `2026/10/30 0:38:09`… None if Windows can't.
+#[cfg(windows)]
+pub fn local_date_time(t: chrono::NaiveDateTime) -> Option<String> {
+    use chrono::{Datelike, Timelike};
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::Globalization::{DATE_SHORTDATE, GetDateFormatEx, GetTimeFormatEx};
+    let st = SYSTEMTIME {
+        wYear: t.year() as u16,
+        wMonth: t.month() as u16,
+        wDayOfWeek: t.weekday().num_days_from_sunday() as u16,
+        wDay: t.day() as u16,
+        wHour: t.hour() as u16,
+        wMinute: t.minute() as u16,
+        wSecond: t.second() as u16,
+        wMilliseconds: 0,
+    };
+    let mut date = [0u16; 80];
+    let mut time = [0u16; 80];
+    // SAFETY: null locale = the user's; the buffers' lengths are passed in characters.
+    let (d, h) = unsafe {
+        (
+            GetDateFormatEx(
+                std::ptr::null(),
+                DATE_SHORTDATE,
+                &st,
+                std::ptr::null(),
+                date.as_mut_ptr(),
+                date.len() as i32,
+                std::ptr::null(),
+            ),
+            GetTimeFormatEx(
+                std::ptr::null(),
+                0,
+                &st,
+                std::ptr::null(),
+                time.as_mut_ptr(),
+                time.len() as i32,
+            ),
+        )
+    };
+    if d <= 1 || h <= 1 {
+        return None;
+    }
+    let date = String::from_utf16_lossy(&date[..d as usize - 1]);
+    let time = String::from_utf16_lossy(&time[..h as usize - 1]);
+    Some(format!("{date} {time}"))
+}
+
+/// Elsewhere the language's convention (`LC_ALL`, `LC_TIME`, `LANG`) is used by
+/// `mdm_core::regional`, so there is no system format to ask about here.
+#[cfg(not(windows))]
+pub fn local_date_time(_t: chrono::NaiveDateTime) -> Option<String> {
+    None
+}
+
 /// Whether this computer can be woken by MDM, and if not, why.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
