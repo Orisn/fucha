@@ -444,7 +444,9 @@ pub enum Job {
         job: mdm_tools::gallery::GalleryJob,
         url: Url,
     },
-    Torrent(crate::torrents::Run),
+    /// A torrent: the app's librqbit session runs it, behind core's handle so this model can
+    /// move to mdm-core.
+    Torrent(Box<dyn mdm_core::torrent::TorrentHandle>),
     /// A torrent through a debrid account, then its files over HTTP (#44).
     Remote(mdm_debrid::torrents::RemoteTorrent),
 }

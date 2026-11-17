@@ -2840,10 +2840,11 @@ impl App {
         let mut seen = HashMap::new();
         let mut new = 0u64;
         for i in &self.items {
-            let Some(model::Job::Torrent(run)) = i.live.as_ref().map(|l| &l.dl) else {
+            let Some(model::Job::Torrent(handle)) = i.live.as_ref().map(|l| &l.dl) else {
                 continue;
             };
-            let Some(fetched) = run.fetched() else {
+            let Some(fetched) = crate::torrents::as_run(&**handle).and_then(|run| run.fetched())
+            else {
                 continue;
             };
             if let Some(&before) = self.torrent_fetched.get(&i.id) {
@@ -3880,7 +3881,9 @@ impl App {
             spec.ends_first = !spec.ends_first;
         }
         let order = spec.order();
-        if let Some(model::Job::Torrent(run)) = item.live.as_ref().map(|l| &l.dl) {
+        if let Some(model::Job::Torrent(handle)) = item.live.as_ref().map(|l| &l.dl)
+            && let Some(run) = crate::torrents::as_run(&**handle)
+        {
             run.set_order(order);
         }
         self.dirty = true;
@@ -3913,7 +3916,10 @@ impl App {
             // i18n: event log entry, past tense: the download started (just now)
             crate::i18n::t("Started")
         });
-        item.live = Some(Live::new(model::Job::Torrent(run), item.downloaded));
+        item.live = Some(Live::new(
+            model::Job::Torrent(Box::new(run)),
+            item.downloaded,
+        ));
         item.status = Status::Downloading;
         item.error = None;
         item.last_try = Some(model::now_stamp());
@@ -8561,7 +8567,9 @@ impl App {
                         // Kept with the torrent; a Run sets it now, a torrent sharing without
                         // one gets it at the next torrent_tick (torrent_accounts).
                         spec.upload_limit = limit;
-                        if let Some(model::Job::Torrent(run)) = item.live.as_ref().map(|l| &l.dl) {
+                        if let Some(model::Job::Torrent(handle)) = item.live.as_ref().map(|l| &l.dl)
+                            && let Some(run) = crate::torrents::as_run(&**handle)
+                        {
                             run.set_upload_limit(limit);
                         }
                         self.dirty = true;

@@ -1129,9 +1129,9 @@ impl Progress {
     fn torrent_details(&mut self, ui: &mut Ui, p: &egui::Painter, o: Pos2, item: &Item) {
         let d = match &item.live {
             Some(crate::model::Live {
-                dl: crate::model::Job::Torrent(run),
+                dl: crate::model::Job::Torrent(handle),
                 ..
-            }) => Some(run.details()),
+            }) => crate::torrents::as_run(&**handle).map(|run| run.details()),
             // Finished and still shared (no Run): the session has it all the same, so the
             // tabs stay, the General tab's share ratio included.
             _ => self

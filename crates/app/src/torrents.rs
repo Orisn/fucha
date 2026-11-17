@@ -968,6 +968,35 @@ impl Run {
     }
 }
 
+impl mdm_core::torrent::TorrentHandle for Run {
+    fn snapshot(&self) -> Snapshot {
+        Run::snapshot(self)
+    }
+
+    fn cancel(&self) {
+        Run::cancel(self)
+    }
+
+    fn set_speed_limit(&self, rate: Option<u64>) {
+        Run::set_speed_limit(self, rate)
+    }
+
+    fn speed_limit(&self) -> Option<u64> {
+        Run::speed_limit(self)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// The app's [`Run`] behind a [`mdm_core::torrent::TorrentHandle`] (`Job::Torrent`): for the
+/// controls the download list and the progress window keep on it (piece order, upload limit,
+/// fetched bytes, its tab details), which the core trait doesn't carry.
+pub fn as_run(handle: &dyn mdm_core::torrent::TorrentHandle) -> Option<&Run> {
+    handle.as_any().downcast_ref::<Run>()
+}
+
 /// What the progress window's torrent tabs show for `hash`, from the session: a `Run`'s
 /// torrent, or a finished one still shared without a `Run` (None: not in the session).
 pub fn details_of(t: &Torrents, hash: &str) -> Option<Details> {
