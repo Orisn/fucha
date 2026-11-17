@@ -4941,11 +4941,8 @@ version = "0.5.2"
 dependencies = [
  "arboard",
  "base64 0.23.1",
- "brotli",
- "brotli-decompressor",
  "chrono",
  "craft-atomic",
- "craft-i18n",
  "dirs 7.0.0",
  "drag",
  "eframe",
@@ -4955,6 +4952,7 @@ dependencies = [
  "image",
  "libc",
  "mdm-cli",
+ "mdm-core",
  "mdm-crash",
  "mdm-debrid",
  "mdm-engine",
@@ -4975,7 +4973,6 @@ dependencies = [
  "regex",
  "reqwest 0.13.5",
  "rfd 0.17.2",
- "roxmltree",
  "security-framework",
  "serde",
  "serde_json",
@@ -5012,6 +5009,22 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "url",
+]
+
+[[package]]
+name = "mdm-core"
+version = "0.5.2"
+dependencies = [
+ "brotli",
+ "brotli-decompressor",
+ "craft-i18n",
+ "mdm-ipc",
+ "regex",
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "tempfile",
  "url",
 ]
 
