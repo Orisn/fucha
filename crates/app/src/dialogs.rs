@@ -569,15 +569,7 @@ pub fn display_path(p: &Path) -> String {
     }
 }
 
-/// The inverse of `display_path`: relative paths are under the user profile.
-pub fn resolve_path(s: &str) -> PathBuf {
-    let p = PathBuf::from(s.trim());
-    if p.is_absolute() {
-        p
-    } else {
-        dirs::home_dir().map_or(p.clone(), |h| h.join(p))
-    }
-}
+pub use mdm_core::paths::resolve_path;
 
 /// IDM's dialog size text, e.g. `60.00  MB` (two spaces, as measured).
 pub fn dialog_size(b: u64) -> String {

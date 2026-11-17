@@ -5,6 +5,8 @@
 
 pub mod countries;
 pub mod i18n;
+pub mod paths;
 pub mod queue;
 pub mod quota;
+pub mod regional;
 pub mod rss;

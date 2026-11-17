@@ -7,15 +7,7 @@ use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
-/// The order of a date's day, month and year.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DateOrder {
-    Dmy,
-    #[default]
-    Mdy,
-    Ymd,
-}
+pub use mdm_platform::DateOrder;
 
 /// What Options → Regional holds (saved in the settings by these names).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +72,7 @@ pub fn effective(r: &Regional) -> Formats {
 /// East Asia and Hungary year first, the rest day first and 24-hour.
 pub fn system() -> Regional {
     #[cfg(windows)]
-    if let Some((order, clock24, week_start)) = crate::win32::region_formats() {
+    if let Some((order, clock24, week_start)) = mdm_platform::region_formats() {
         return Regional {
             custom: false,
             order,

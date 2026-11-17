@@ -38,7 +38,7 @@ mod progress;
 mod properties;
 pub use mdm_core::queue;
 pub use mdm_core::quota;
-mod regional;
+pub use mdm_core::regional;
 mod remote;
 mod renderer;
 pub use mdm_core::rss;

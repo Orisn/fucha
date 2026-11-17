@@ -11,7 +11,10 @@ publish.workspace = true
 [dependencies]
 craft-i18n.workspace = true
 brotli-decompressor = "6.2.0"
+chrono.workspace = true
+dirs.workspace = true
 mdm-ipc.workspace = true
+mdm-platform.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 url.workspace = true
