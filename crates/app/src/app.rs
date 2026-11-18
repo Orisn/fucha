@@ -20,7 +20,7 @@ use crate::icons::Icon;
 use crate::list;
 use crate::model::{self, Category, Item, Live, Status};
 use crate::progress::{self, Progress};
-use crate::queue::{self, Queue};
+use crate::queue::Queue;
 use crate::settings::Settings;
 use crate::store;
 use crate::winui;
@@ -5267,44 +5267,19 @@ impl App {
         if !self.moving.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
-        let mut finished = Vec::new();
-        let mut failed = Vec::new();
-        let mut any_live = false;
-        for i in &mut self.core.items {
-            if i.poll() {
-                self.core.dirty = true;
-                match i.status {
-                    Status::Complete => finished.push(i.id),
-                    Status::Error => failed.push(i.id),
-                    _ => {}
-                }
-            }
-            any_live |= i.live.is_some();
-        }
+        let polled = self.core.poll_items();
         let now = Instant::now();
         self.check_limits(now);
-        if !finished.is_empty() {
+        if !polled.finished.is_empty() {
             self.sound(0);
         }
-        if !failed.is_empty() {
+        if !polled.failed.is_empty() {
             self.sound(1);
         }
-        for id in failed {
-            let e = self.core.failures.entry(id).or_insert((now, 0));
-            *e = (now, e.1 + 1);
-            for q in &mut self.core.queues {
-                queue::requeue_failed(q, id);
-            }
-        }
-        for id in &finished {
-            self.core.failures.remove(id);
+        for id in &polled.finished {
             // Its archive, when it is to be extracted and its last volume is in (#37).
             self.extracts
                 .finished(*id, &self.core.items, &self.core.settings);
-            // Finished files leave download queues (synchronization queues keep them).
-            for q in self.core.queues.iter_mut().filter(|q| !q.sync) {
-                q.items.retain(|x| x != id);
-            }
         }
         if self.extracts.poll(&mut self.core.items, ctx) {
             self.core.dirty = true;
@@ -5313,7 +5288,7 @@ impl App {
         // A download started early behind Download File Info stays quiet until the dialog's
         // answer (Start shows its box then; Cancel drops it).
         let early = self.file_info.as_ref().and_then(|f| f.early);
-        for id in finished {
+        for id in polled.finished {
             // This file's "Show download complete dialog" (its progress window's Options on
             // completion tab), read before the window closes.
             let window = self.progress.iter().find(|p| p.id == id);
@@ -5340,7 +5315,7 @@ impl App {
                 });
             }
         }
-        if any_live {
+        if polled.any_live {
             ctx.request_repaint_after(Duration::from_millis(250));
             // The list's progress figures, every 30 s while something runs: after a crash the
             // rows show about where each download was (torrents keep their own resume data,

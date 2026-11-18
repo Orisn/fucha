@@ -67,6 +67,14 @@ pub enum LimitEffect {
     Notice { mb: u32, hours: u32, wait: Duration },
 }
 
+/// What polling the downloads found: whether any is still running, and the ids that just
+/// finished or failed (the app plays sounds and opens windows for them).
+pub struct PollResult {
+    pub any_live: bool,
+    pub finished: Vec<u64>,
+    pub failed: Vec<u64>,
+}
+
 fn seconds_now() -> u32 {
     use chrono::Timelike;
     chrono::Local::now().num_seconds_from_midnight()
@@ -350,6 +358,46 @@ impl Core {
             None => {}
         }
         effects
+    }
+
+    /// Take each download's engine snapshot into the list. A download that finished leaves the
+    /// non-synchronization queues and its failure count; a failed one is counted and moved to
+    /// the end. The app plays the sounds and opens the windows the result names.
+    pub fn poll_items(&mut self) -> PollResult {
+        let mut finished = Vec::new();
+        let mut failed = Vec::new();
+        let mut any_live = false;
+        for i in &mut self.items {
+            if i.poll() {
+                self.dirty = true;
+                match i.status {
+                    Status::Complete => finished.push(i.id),
+                    Status::Error => failed.push(i.id),
+                    _ => {}
+                }
+            }
+            any_live |= i.live.is_some();
+        }
+        let now = Instant::now();
+        for id in &failed {
+            let e = self.failures.entry(*id).or_insert((now, 0));
+            *e = (now, e.1 + 1);
+            for q in &mut self.queues {
+                queue::requeue_failed(q, *id);
+            }
+        }
+        for id in &finished {
+            self.failures.remove(id);
+            // Finished files leave download queues (synchronization queues keep them).
+            for q in self.queues.iter_mut().filter(|q| !q.sync) {
+                q.items.retain(|x| x != id);
+            }
+        }
+        PollResult {
+            any_live,
+            finished,
+            failed,
+        }
     }
 
     /// The download with this id, to change it in place.
