@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use egui::{Pos2, Ui, pos2};
+use mdm_engine::Options;
 use mdm_engine::state::state_path;
-use mdm_engine::{Destination, Download, Options, Request};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 use crate::chrome::{
@@ -24,7 +24,8 @@ use crate::queue::Queue;
 use crate::settings::Settings;
 use crate::store;
 use crate::winui;
-use mdm_core::session::Core;
+pub use mdm_core::session::RequestParts;
+use mdm_core::session::{Core, place_in, take_place};
 use mdm_ipc as ipc;
 
 pub use mdm_core::ui::View;
@@ -216,84 +217,6 @@ fn cant_move_notice() -> (&'static str, String) {
         )
         .to_owned(),
     )
-}
-
-/// Where one download of a selection goes in `dir`: a name free there (on disk, what
-/// `naming::destination` checks) and not one the selection has taken (two not started under one
-/// name have no file yet to be seen).
-fn place_in(
-    dir: &std::path::Path,
-    name: &str,
-    taken: &mut std::collections::HashSet<PathBuf>,
-) -> PathBuf {
-    let (stem, ext) = match name.rfind('.') {
-        Some(i) if i > 0 => (&name[..i], &name[i..]),
-        _ => (name, ""),
-    };
-    let mut at = mdm_engine::naming::destination(dir, name);
-    let mut n = 1u32;
-    while !taken.insert(at.clone()) {
-        at = mdm_engine::naming::destination(dir, &format!("{stem} ({n}){ext}"));
-        n += 1;
-    }
-    at
-}
-
-/// A download's new place (its name from it). A name the user gave is no longer the address's
-/// guess (`Item::name_from_url`); another folder alone keeps the server's say.
-fn take_place(item: &mut Item, target: PathBuf) {
-    if let Some(name) = target.file_name() {
-        let name = name.to_string_lossy().into_owned();
-        if name != item.file_name {
-            item.name_from_url = false;
-        }
-        item.file_name = name;
-    }
-    item.dest = target;
-}
-
-/// The place a download about to start takes instead of its own, when its own belongs to
-/// another row (#442): two can wait under one name (nothing was on the disk when each was added,
-/// and they can start in the same moment, before the engine has reserved anything). None: it
-/// stays. A row with data of its own never moves, so a resume finds its pieces.
-fn place_to_take(item: &Item, items: &[Item]) -> Option<PathBuf> {
-    if item.downloaded > 0 || item.owns_resume_state() {
-        return None;
-    }
-    let dir = item.dest.parent()?;
-    let others = || {
-        items
-            .iter()
-            .filter(|o| o.id != item.id && o.dest.parent() == Some(dir))
-    };
-    let lower = |p: &std::path::Path| p.to_string_lossy().to_lowercase();
-    let stem = |o: &Item| {
-        o.dest
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_lowercase())
-    };
-    if item.video.is_some() {
-        // yt-dlp takes any `<stem>.*` there as its own (#32): the stem has to be free.
-        others()
-            .any(|o| stem(o) == stem(item) && o.holds_place())
-            .then(|| {
-                mdm_engine::naming::stem_destination(dir, &item.file_name, |s| {
-                    let s = s.to_lowercase();
-                    others().any(|o| stem(o).as_ref() == Some(&s) && o.holds_place())
-                })
-            })
-    } else {
-        others()
-            .any(|o| lower(&o.dest) == lower(&item.dest) && o.holds_place())
-            .then(|| {
-                let mut taken: std::collections::HashSet<PathBuf> = others()
-                    .filter(|o| o.holds_place())
-                    .map(|o| o.dest.clone())
-                    .collect();
-                taken.insert(item.dest.clone());
-                place_in(dir, &item.file_name, &mut taken)
-            })
-    }
 }
 
 /// The status strip's height, under the list and the Categories pane.
@@ -647,15 +570,6 @@ fn url_login(url: &url::Url) -> Option<(String, String)> {
 }
 
 /// `Authorization: Basic …` for "Use authorization".
-/// What a download's requests carry: its headers (a login, the browser's Referer and Cookie, a
-/// form's Content-Type) and the options its requests go with (User-Agent, proxy, a form's body).
-/// Download File Info's look-up asks with the same as the download, so both get one answer.
-#[derive(Clone)]
-pub struct RequestParts {
-    pub headers: HeaderMap,
-    pub opts: Options,
-}
-
 /// The Referer a browser would send for `url` from page `referrer` (its default policy,
 /// strict-origin-when-cross-origin): the whole address on the same site, only the site's origin
 /// to another, nothing from https to http.
@@ -2502,24 +2416,12 @@ impl App {
     /// Before a download starts: into a free place of its own if its own is another row's
     /// (`place_to_take`). The name stays the address's guess if it was one.
     fn claim_place(&mut self, id: u64) {
-        let target = self
-            .core
-            .items
-            .iter()
-            .find(|i| i.id == id)
-            .and_then(|i| place_to_take(i, &self.core.items));
-        if let (Some(target), Some(item)) = (target, self.item(id)) {
-            let guessed = item.name_from_url;
-            take_place(item, target);
-            item.name_from_url = guessed;
-            self.core.dirty = true;
-        }
+        self.core.claim_place(id);
     }
 
     /// Start or resume a download; `show` opens its progress dialog (IDM's default).
     fn start(&mut self, id: u64, show: bool) {
         self.core.stopped_by_hand.remove(&id);
-        let rt = self.core.rt.clone();
         let Some(item) = self.item(id) else { return };
         // A finished gallery may start again: it fetches the files not there yet (#58).
         if item.live.is_some() || (item.status == Status::Complete && item.gallery.is_none()) {
@@ -2587,57 +2489,10 @@ impl App {
         // The file's own remembered limit, else the Speed Limiter's.
         opts.speed_limit = own_limit.or(self.core.settings.speed_limit());
         opts.checksum = checksum;
-        self.claim_place(id);
-        let Some(item) = self.item(id) else { return };
-        let _guard = rt.enter();
-        // Resume whenever there is something to resume. If that fails, say why and keep the
-        // data: starting over would overwrite it, and that is only ever the user's choice.
-        let state = state_path(&item.dest);
-        let dl = if state.exists() {
-            match Download::resume(state, headers, opts) {
-                Ok(dl) => dl,
-                Err(e) => {
-                    item.status = Status::Error;
-                    item.error = Some(crate::errors::describe(&e));
-                    item.last_try = Some(model::now_stamp());
-                    self.core.dirty = true;
-                    return;
-                }
-            }
-        } else {
-            // Nothing to resume. A missing folder is created by the engine; a removed drive is
-            // reported without touching the progress shown for the data on it.
-            if item.dest.parent().is_none_or(std::path::Path::is_dir) {
-                item.downloaded = 0;
-            }
-            // A name nobody gave (the address's guess) is the server's to give: into the folder,
-            // under its Content-Disposition name (#28); the row follows the file made.
-            let dest = match item.dest.parent() {
-                Some(dir) if item.name_from_url => Destination::Dir(dir.to_owned()),
-                _ => Destination::File(item.dest.clone()),
-            };
-            Download::start_with(
-                Request {
-                    url: item.url.clone(),
-                    headers,
-                    dest,
-                },
-                opts,
-                kept,
-            )
-        };
-        item.note(if item.downloaded > 0 {
-            // i18n: event log entry, past tense: the download resumed (just now)
-            crate::i18n::t("Resumed")
-        } else {
-            // i18n: event log entry, past tense: the download started (just now)
-            crate::i18n::t("Started")
-        });
-        item.live = Some(Live::new(model::Job::File(dl), item.downloaded));
-        item.status = Status::Downloading;
-        item.error = None;
-        item.last_try = Some(model::now_stamp());
-        self.core.dirty = true;
+        let parts = RequestParts { headers, opts };
+        if !self.core.start_file(id, parts, kept) {
+            return;
+        }
         if show && !self.progress.iter().any(|p| p.id == id) {
             self.progress
                 .push(Progress::new(id, self.core.settings.show_complete));
@@ -8722,8 +8577,9 @@ mod move_many_tests {
 
 #[cfg(test)]
 mod same_name_tests {
-    use super::{Item, place_to_take};
+    use super::Item;
     use crate::model::{Category, Status};
+    use mdm_core::session::place_to_take;
     use std::path::Path;
 
     fn row(id: u64, dest: &Path, status: Status, downloaded: u64) -> Item {

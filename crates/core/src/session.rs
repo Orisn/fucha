@@ -3,16 +3,19 @@
 //! reaches this state through `Deref`; Fucha's Tauri backend will drive it directly.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mdm_engine::hosts::HostLimits;
 use mdm_engine::limiter::Limiter;
+use mdm_engine::state::state_path;
+use mdm_engine::{Destination, Download, KeptAnswer, Options, Request};
 use mdm_ipc as ipc;
+use reqwest::header::HeaderMap;
 
 use crate::layout::Layout;
-use crate::model::{Category, Item, Status};
+use crate::model::{Category, Item, Job, Live, Status};
 use crate::queue::{self, Member, Queue};
 use crate::quota::Quota;
 use crate::settings::Settings;
@@ -82,6 +85,87 @@ fn seconds_now() -> u32 {
 
 fn member_in(members: &HashMap<u64, Member>, id: u64) -> Member {
     members.get(&id).copied().unwrap_or(Member::Complete)
+}
+
+/// What a download's requests carry: its headers (a login, the browser's Referer and Cookie, a
+/// form's Content-Type) and the options its requests go with (User-Agent, proxy, a form's body).
+/// Download File Info's look-up asks with the same as the download, so both get one answer.
+#[derive(Clone)]
+pub struct RequestParts {
+    pub headers: HeaderMap,
+    pub opts: Options,
+}
+
+/// A free place for `name` in `dir`, numbered when it is taken (`file (1).ext`…).
+pub fn place_in(dir: &Path, name: &str, taken: &mut HashSet<PathBuf>) -> PathBuf {
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    let mut at = mdm_engine::naming::destination(dir, name);
+    let mut n = 1u32;
+    while !taken.insert(at.clone()) {
+        at = mdm_engine::naming::destination(dir, &format!("{stem} ({n}){ext}"));
+        n += 1;
+    }
+    at
+}
+
+/// A download's new place (its name from it). A name the user gave is no longer the address's
+/// guess (`Item::name_from_url`); another folder alone keeps the server's say.
+pub fn take_place(item: &mut Item, target: PathBuf) {
+    if let Some(name) = target.file_name() {
+        let name = name.to_string_lossy().into_owned();
+        if name != item.file_name {
+            item.name_from_url = false;
+        }
+        item.file_name = name;
+    }
+    item.dest = target;
+}
+
+/// The place a download about to start takes instead of its own, when its own belongs to
+/// another row (#442): two can wait under one name (nothing was on the disk when each was added,
+/// and they can start in the same moment, before the engine has reserved anything). None: it
+/// stays. A row with data of its own never moves, so a resume finds its pieces.
+pub fn place_to_take(item: &Item, items: &[Item]) -> Option<PathBuf> {
+    if item.downloaded > 0 || item.owns_resume_state() {
+        return None;
+    }
+    let dir = item.dest.parent()?;
+    let others = || {
+        items
+            .iter()
+            .filter(|o| o.id != item.id && o.dest.parent() == Some(dir))
+    };
+    let lower = |p: &Path| p.to_string_lossy().to_lowercase();
+    let stem = |o: &Item| {
+        o.dest
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+    };
+    if item.video.is_some() {
+        // yt-dlp takes any `<stem>.*` there as its own (#32): the stem has to be free.
+        others()
+            .any(|o| stem(o) == stem(item) && o.holds_place())
+            .then(|| {
+                mdm_engine::naming::stem_destination(dir, &item.file_name, |s| {
+                    let s = s.to_lowercase();
+                    others().any(|o| stem(o).as_ref() == Some(&s) && o.holds_place())
+                })
+            })
+    } else {
+        others()
+            .any(|o| lower(&o.dest) == lower(&item.dest) && o.holds_place())
+            .then(|| {
+                let mut taken: HashSet<PathBuf> = others()
+                    .filter(|o| o.holds_place())
+                    .map(|o| o.dest.clone())
+                    .collect();
+                taken.insert(item.dest.clone());
+                place_in(dir, &item.file_name, &mut taken)
+            })
+    }
 }
 
 impl Core {
@@ -398,6 +482,82 @@ impl Core {
             finished,
             failed,
         }
+    }
+
+    /// Before a download starts: into a free place of its own if its own is another row's
+    /// (`place_to_take`). The name stays the address's guess if it was one.
+    pub fn claim_place(&mut self, id: u64) {
+        let target = self
+            .items
+            .iter()
+            .find(|i| i.id == id)
+            .and_then(|i| place_to_take(i, &self.items));
+        if let (Some(target), Some(item)) = (target, self.items.iter_mut().find(|i| i.id == id)) {
+            let guessed = item.name_from_url;
+            take_place(item, target);
+            item.name_from_url = guessed;
+            self.dirty = true;
+        }
+    }
+
+    /// Start or resume a file download from the parts the app prepared. True once the engine
+    /// job is live; false when it couldn't start (the row says why).
+    pub fn start_file(&mut self, id: u64, parts: RequestParts, kept: Option<KeptAnswer>) -> bool {
+        self.claim_place(id);
+        let rt = self.rt.clone();
+        let Some(item) = self.items.iter_mut().find(|i| i.id == id) else {
+            return false;
+        };
+        let _guard = rt.enter();
+        // Resume whenever there is something to resume. If that fails, say why and keep the
+        // data: starting over would overwrite it, and that is only ever the user's choice.
+        let state = state_path(&item.dest);
+        let dl = if state.exists() {
+            match Download::resume(state, parts.headers, parts.opts) {
+                Ok(dl) => dl,
+                Err(e) => {
+                    item.status = Status::Error;
+                    item.error = Some(crate::errors::describe(&e));
+                    item.last_try = Some(crate::model::now_stamp());
+                    self.dirty = true;
+                    return false;
+                }
+            }
+        } else {
+            // Nothing to resume. A missing folder is created by the engine; a removed drive is
+            // reported without touching the progress shown for the data on it.
+            if item.dest.parent().is_none_or(Path::is_dir) {
+                item.downloaded = 0;
+            }
+            // A name nobody gave (the address's guess) is the server's to give: into the folder,
+            // under its Content-Disposition name (#28); the row follows the file made.
+            let dest = match item.dest.parent() {
+                Some(dir) if item.name_from_url => Destination::Dir(dir.to_owned()),
+                _ => Destination::File(item.dest.clone()),
+            };
+            Download::start_with(
+                Request {
+                    url: item.url.clone(),
+                    headers: parts.headers,
+                    dest,
+                },
+                parts.opts,
+                kept,
+            )
+        };
+        item.note(if item.downloaded > 0 {
+            // i18n: event log entry, past tense: the download resumed (just now)
+            crate::i18n::t("Resumed")
+        } else {
+            // i18n: event log entry, past tense: the download started (just now)
+            crate::i18n::t("Started")
+        });
+        item.live = Some(Live::new(Job::File(dl), item.downloaded));
+        item.status = Status::Downloading;
+        item.error = None;
+        item.last_try = Some(crate::model::now_stamp());
+        self.dirty = true;
+        true
     }
 
     /// The download with this id, to change it in place.
