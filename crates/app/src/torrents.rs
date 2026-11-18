@@ -14,16 +14,8 @@ use mdm_engine::Snapshot;
 use mdm_engine::download::State;
 use mdm_torrent::{Config, Phase, Torrents};
 
+pub use mdm_core::torrent::{BLOCKLIST_FILE, SharingLimits, route_bind};
 pub use mdm_core::torrent_spec::TorrentSpec;
-
-/// Torrent settings' seeding limits (`Settings::sharing_limits`).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct SharingLimits {
-    /// Stop at this share ratio (sent ÷ what is there).
-    pub ratio: Option<f64>,
-    /// Stop after this many seconds of sharing once finished.
-    pub secs: Option<u64>,
-}
 
 /// Which seeding limit a finished torrent reached.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -210,8 +202,6 @@ pub async fn fetch_small(remote: Remote, max: u64) -> Result<Option<Vec<u8>>, St
     bytes
 }
 
-/// The blocklist as MDM converted it (mdm_torrent::blocklist), in the torrent data folder.
-pub const BLOCKLIST_FILE: &str = "blocklist.p2p";
 /// The address it was fetched from (another address: fetched again).
 const BLOCKLIST_SOURCE: &str = "blocklist.source";
 /// How often a blocklist is fetched again.
@@ -285,36 +275,6 @@ pub fn refresh_blocklist(
         let _ = std::fs::remove_file(mdm_engine::state::state_path(&download));
         busy.store(false, Ordering::SeqCst);
     });
-}
-
-/// How the torrent session is held to the network adapter as it is (#35, #143): None without
-/// one chosen; else why torrents can't start (it isn't connected).
-pub fn route_bind(route: &mdm_engine::Route) -> Result<Option<mdm_torrent::Bind>, String> {
-    let down = |label: &str| {
-        crate::i18n::fmt(
-            // i18n: an error: the network adapter chosen in Options (a VPN's, usually) is off or gone; {adapter} its name
-            crate::i18n::t("the network adapter {adapter} is not connected"),
-            &[("adapter", label)],
-        )
-    };
-    match route {
-        mdm_engine::Route::Any => Ok(None),
-        mdm_engine::Route::Down { label } => Err(down(label)),
-        // Windows: its address (strong host model, see mdm_engine::net); IPv4 when it has one.
-        #[cfg(windows)]
-        mdm_engine::Route::Bound(b) => {
-            b.v4.map(std::net::IpAddr::V4)
-                .or(b.v6.map(std::net::IpAddr::V6))
-                .map(|ip| Some(mdm_torrent::Bind::Address(ip)))
-                .ok_or_else(|| down(&b.label))
-        }
-        // Linux and macOS: its device.
-        #[cfg(not(windows))]
-        mdm_engine::Route::Bound(b) => Ok(Some(mdm_torrent::Bind::Device {
-            name: b.name.clone(),
-            v4_only: b.v6.is_none(),
-        })),
-    }
 }
 
 /// The app's one session, started on first use, as Torrent settings say (`set_config`); it
