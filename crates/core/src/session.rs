@@ -729,6 +729,54 @@ impl Core {
         true
     }
 
+    /// Start or resume a torrent through a debrid account (#44), from the settings' network
+    /// options. True once the remote job is live; the app opens its progress window.
+    pub fn start_remote(&mut self, id: u64) -> bool {
+        let limit = self.settings.speed_limit();
+        let Some((url, spec, own)) = self
+            .items
+            .iter()
+            .find(|i| i.id == id)
+            .and_then(|i| Some((i.url.clone(), i.remote.clone()?, i.own_limit)))
+        else {
+            return false;
+        };
+        // The files' requests: Options' connections, proxy, DNS and adapter; the service's own
+        // unlocking is the torrent job's (not a host's link).
+        let mut net = self
+            .request_parts(&url, None, &Default::default(), true)
+            .opts;
+        net.speed_limit = own.or(limit);
+        let rt = self.rt.clone();
+        let _guard = rt.enter();
+        let debrid = self.debrid.clone();
+        let job = mdm_debrid::torrents::RemoteTorrent::start(
+            &debrid,
+            mdm_debrid::torrents::Order {
+                account: spec.account,
+                magnet: url,
+                transfer: spec.transfer.clone(),
+                folder: spec.folder.clone(),
+                net,
+                poll: Duration::from_secs(5),
+            },
+        );
+        let Some(item) = self.items.iter_mut().find(|i| i.id == id) else {
+            return false;
+        };
+        item.note(if spec.transfer.is_some() {
+            crate::i18n::t("Resumed")
+        } else {
+            crate::i18n::t("Started")
+        });
+        item.live = Some(Live::new(Job::Remote(job), item.downloaded));
+        item.status = Status::Downloading;
+        item.error = None;
+        item.last_try = Some(crate::model::now_stamp());
+        self.dirty = true;
+        true
+    }
+
     /// The download with this id, to change it in place.
     pub fn item(&mut self, id: u64) -> Option<&mut Item> {
         self.items.iter_mut().find(|i| i.id == id)

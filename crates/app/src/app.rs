@@ -3467,43 +3467,9 @@ impl App {
 
     /// Start (or continue) a torrent through its debrid account (#44).
     fn start_remote(&mut self, id: u64, show: bool) {
-        let limit = self.core.settings.speed_limit();
-        let Some((url, spec, own)) = self
-            .item(id)
-            .and_then(|i| Some((i.url.clone(), i.remote.clone()?, i.own_limit)))
-        else {
+        if !self.core.start_remote(id) {
             return;
-        };
-        // The files' requests: Options' connections, proxy, DNS and adapter; the service's own
-        // unlocking is the torrent job's (not a host's link).
-        let mut net = self
-            .request_parts(&url, None, &Default::default(), true)
-            .opts;
-        net.speed_limit = own.or(limit);
-        let rt = self.core.rt.clone();
-        let _guard = rt.enter();
-        let job = mdm_debrid::torrents::RemoteTorrent::start(
-            &self.core.debrid,
-            mdm_debrid::torrents::Order {
-                account: spec.account,
-                magnet: url,
-                transfer: spec.transfer.clone(),
-                folder: spec.folder.clone(),
-                net,
-                poll: std::time::Duration::from_secs(5),
-            },
-        );
-        let Some(item) = self.item(id) else { return };
-        item.note(if spec.transfer.is_some() {
-            crate::i18n::t("Resumed")
-        } else {
-            crate::i18n::t("Started")
-        });
-        item.live = Some(Live::new(model::Job::Remote(job), item.downloaded));
-        item.status = Status::Downloading;
-        item.error = None;
-        item.last_try = Some(model::now_stamp());
-        self.core.dirty = true;
+        }
         if show && !self.progress.iter().any(|p| p.id == id) {
             self.progress
                 .push(Progress::new(id, self.core.settings.show_complete));
