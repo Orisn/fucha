@@ -12,6 +12,7 @@ pub mod queue;
 pub mod quota;
 pub mod regional;
 pub mod rss;
+pub mod secrets;
 pub mod torrent;
 pub mod torrent_spec;
 pub mod ui;

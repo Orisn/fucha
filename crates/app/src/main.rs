@@ -205,6 +205,9 @@ pub fn can_start_in_tray() -> bool {
 
 fn main() -> std::process::ExitCode {
     renderer::mark_start();
+    // The app's keychain for the logic that moved to mdm-core (`mdm_core::secrets`), once for
+    // this process; later installs are ignored.
+    secrets::install();
     // PAC's myIpAddress from the routing table, not a UDP socket (a firewall prompt, #35).
     #[cfg(windows)]
     mdm_engine::net::set_source_lookup(win32::source_address);

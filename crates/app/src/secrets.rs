@@ -30,8 +30,9 @@ use crate::win32 as os;
 /// The keychain's name for MDM's entries (Credential Manager's targets start with it; Secret
 /// Service's `service` attribute; the macOS keychain's service).
 pub const SERVICE: &str = "Mister Download Manager";
-/// What the settings hold in a secret's place.
-pub const REF: &str = "keychain:";
+/// What the settings hold in a secret's place (`mdm_core::secrets::REF`: one definition for the
+/// logic that moves there).
+pub use mdm_core::secrets::REF;
 
 /// Where the secrets are kept, for Options → Accounts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -478,12 +479,47 @@ impl Pass<'_> {
     }
 
     /// The places these settings use: kept; the others may go after the next write.
-    pub fn finish(self) {
+    pub fn finish(&mut self) {
         let v = self.vault;
-        v.lock().wanted = self.wanted;
+        v.lock().wanted = std::mem::take(&mut self.wanted);
         if self.work {
             v.start();
         }
+    }
+}
+
+// The interfaces `mdm-core` asks for (its `secrets` module), so the settings' logic can move
+// there: the keychain stays here, behind them.
+
+impl mdm_core::secrets::Vault for Vault {
+    fn is_prepared(&self) -> bool {
+        is_prepared()
+    }
+
+    fn prepared(&self, f: &mut dyn FnMut()) {
+        prepared(|| f());
+    }
+
+    fn open(&self, stored: &str) -> String {
+        Vault::open(self, stored)
+    }
+
+    fn pass(&self) -> Box<dyn mdm_core::secrets::Pass + '_> {
+        Box::new(Vault::pass(self))
+    }
+
+    fn after_write(&self) {
+        Vault::after_write(self)
+    }
+}
+
+impl mdm_core::secrets::Pass for Pass<'_> {
+    fn secret(&mut self, key: &str, label: &dyn Fn() -> String, secret: &str) -> Option<String> {
+        Pass::secret(self, key, label, secret)
+    }
+
+    fn finish(&mut self) {
+        Pass::finish(self)
     }
 }
 
@@ -543,6 +579,13 @@ pub fn vault() -> Arc<Vault> {
         return v;
     }
     global().clone()
+}
+
+/// Installs this app's keychain as the one `mdm-core`'s logic asks for
+/// (`mdm_core::secrets::install`). Called once at start; the first call wins, later ones are
+/// ignored.
+pub fn install() {
+    mdm_core::secrets::install(vault() as Arc<dyn mdm_core::secrets::Vault>);
 }
 
 /// Run `f` with `v` as this thread's vault.
