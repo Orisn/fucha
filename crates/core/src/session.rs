@@ -13,7 +13,7 @@ use mdm_ipc as ipc;
 
 use crate::layout::Layout;
 use crate::model::{Category, Item, Status};
-use crate::queue::Queue;
+use crate::queue::{self, Member, Queue};
 use crate::quota::Quota;
 use crate::settings::Settings;
 use crate::store;
@@ -51,6 +51,29 @@ pub struct Core {
 pub enum ActEffect {
     Start(u64),
     Remove { id: u64, files: bool },
+}
+
+/// What a scheduler tick asks the app to do: start a download, or run a finished queue's
+/// "when done" actions (sound, open, turn off, exit).
+pub enum TickEffect {
+    Start(u64),
+    QueueDone(usize),
+}
+
+/// What the download-limit check asks the app to do: start a download again once the window
+/// has room, or show the limit's notice.
+pub enum LimitEffect {
+    Start(u64),
+    Notice { mb: u32, hours: u32, wait: Duration },
+}
+
+fn seconds_now() -> u32 {
+    use chrono::Timelike;
+    chrono::Local::now().num_seconds_from_midnight()
+}
+
+fn member_in(members: &HashMap<u64, Member>, id: u64) -> Member {
+    members.get(&id).copied().unwrap_or(Member::Complete)
 }
 
 impl Core {
@@ -191,6 +214,142 @@ impl Core {
         for id in self.queues[q].items.clone() {
             self.stop(id);
         }
+    }
+
+    /// Each download's standing in a running queue, looked up once.
+    fn members(&self, now: Instant) -> HashMap<u64, Member> {
+        self.items
+            .iter()
+            .map(|i| (i.id, self.member_of(i, now)))
+            .collect()
+    }
+
+    fn member_of(&self, i: &Item, now: Instant) -> Member {
+        let id = i.id;
+        match i.status {
+            Status::Stopped if self.stopped_by_hand.contains(&id) => Member::Held,
+            Status::Queued | Status::Stopped => Member::Waiting,
+            Status::Downloading => Member::Running,
+            Status::Complete => Member::Complete,
+            Status::Error => {
+                let long_ago = now.checked_sub(queue::RETRY_DELAY).unwrap_or(now);
+                let (at, tries) = self.failures.get(&id).copied().unwrap_or((long_ago, 0));
+                Member::Failed { at, tries }
+            }
+        }
+    }
+
+    /// The scheduler's tick: start and stop queues by their schedules, then start what a
+    /// running queue has room for and note queues that finished. The app starts the downloads
+    /// and runs a finished queue's actions, in the returned order.
+    pub fn tick_queues(&mut self) -> Vec<TickEffect> {
+        use chrono::Datelike;
+        let now_s = seconds_now();
+        let prev = std::mem::replace(&mut self.clock, now_s);
+        let today = chrono::Local::now().date_naive();
+        let weekday = today.weekday().num_days_from_sunday() as usize;
+        let date = (today.year(), today.month(), today.day());
+        for q in 0..self.queues.len() {
+            let sch = self.queues[q].schedule.clone();
+            if let Some(t) = sch.start_at
+                && sch.starts_on(date, weekday)
+                && queue::crossed(t, prev, now_s)
+            {
+                self.queues[q].running = true;
+            }
+            if let Some(t) = sch.stop_at
+                && queue::crossed(t, prev, now_s)
+            {
+                self.stop_queue(q);
+            }
+        }
+        let mut effects = Vec::new();
+        let now = Instant::now();
+        for q in 0..self.queues.len() {
+            if !self.queues[q].running {
+                continue;
+            }
+            // Each download's standing, looked up once (a linear search per queued id before).
+            let members = self.members(now);
+            let starts = queue::to_start(&self.queues[q], |id| member_in(&members, id), now);
+            for id in starts {
+                effects.push(TickEffect::Start(id));
+            }
+            let members = self.members(now);
+            if queue::finished(&self.queues[q], |id| member_in(&members, id)) {
+                self.queues[q].running = false;
+                effects.push(TickEffect::QueueDone(q));
+            }
+        }
+        // The next wake follows the schedules (set again when they change), and a queue that
+        // wakes the computer keeps it awake while it runs (#142).
+        self.wake.sync(&self.queues);
+        let waking = self
+            .queues
+            .iter()
+            .find(|q| q.running && q.schedule.wake)
+            .map(|q| q.name.clone());
+        self.wake
+            .keep_awake(waking.is_some(), waking.as_deref().unwrap_or_default());
+        effects
+    }
+
+    /// Scheduler → Download limits: stop at the limit, go on when the window has room. The app
+    /// starts the downloads the returned effects name and shows the notice.
+    pub fn check_limits(&mut self, now: Instant) -> Vec<LimitEffect> {
+        self.quota
+            .record(now, self.items.iter().map(|i| (i.id, i.downloaded)));
+        let s = &self.settings;
+        let limit = u64::from(s.limits_mb.max(1)) << 20;
+        let window = Duration::from_secs(u64::from(s.limits_hours.max(1)) * 3600);
+        let change = if s.limits_on {
+            self.quota.check(now, limit, window)
+        } else if self.quota.blocked {
+            self.quota.blocked = false;
+            Some(false)
+        } else {
+            None
+        };
+        let mut effects = Vec::new();
+        match change {
+            Some(true) => {
+                let running: Vec<u64> = self
+                    .items
+                    .iter()
+                    .filter(|i| i.live.is_some())
+                    .map(|i| i.id)
+                    .collect();
+                for id in running {
+                    self.stop(id);
+                    self.quota.held.push(id);
+                }
+                for id in self.quota.held.clone() {
+                    if let Some(item) = self.item(id) {
+                        item.status = Status::Queued;
+                    }
+                }
+                if self.settings.limits_warn {
+                    let wait = self.quota.room_in(now, limit, window);
+                    effects.push(LimitEffect::Notice {
+                        mb: self.settings.limits_mb,
+                        hours: self.settings.limits_hours,
+                        wait,
+                    });
+                }
+                self.dirty = true;
+            }
+            Some(false) => {
+                for id in std::mem::take(&mut self.quota.held) {
+                    if let Some(item) = self.item(id) {
+                        item.status = Status::Stopped;
+                    }
+                    effects.push(LimitEffect::Start(id));
+                }
+                self.dirty = true;
+            }
+            None => {}
+        }
+        effects
     }
 
     /// The download with this id, to change it in place.

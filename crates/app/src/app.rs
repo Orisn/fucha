@@ -20,7 +20,7 @@ use crate::icons::Icon;
 use crate::list;
 use crate::model::{self, Category, Item, Live, Status};
 use crate::progress::{self, Progress};
-use crate::queue::{self, Member, Queue};
+use crate::queue::{self, Queue};
 use crate::settings::Settings;
 use crate::store;
 use crate::winui;
@@ -184,11 +184,6 @@ enum RssEvent {
         title: String,
         res: Result<mdm_torrent::Meta, String>,
     },
-}
-
-/// A download's standing (a gone one counts as complete: nothing to start).
-fn member_in(members: &std::collections::HashMap<u64, Member>, id: u64) -> Member {
-    members.get(&id).copied().unwrap_or(Member::Complete)
 }
 
 /// A file move's answer, from its thread.
@@ -4737,143 +4732,27 @@ impl App {
         self.core.stop_queue(q);
     }
 
-    /// How a queue sees one of its downloads.
-    /// Every download's standing for the queues, by id.
-    fn members(&self, now: Instant) -> std::collections::HashMap<u64, Member> {
-        self.core
-            .items
-            .iter()
-            .map(|i| (i.id, self.member_of(i, now)))
-            .collect()
-    }
-
-    fn member_of(&self, i: &Item, now: Instant) -> Member {
-        let id = i.id;
-        match i.status {
-            Status::Stopped if self.core.stopped_by_hand.contains(&id) => Member::Held,
-            Status::Queued | Status::Stopped => Member::Waiting,
-            Status::Downloading => Member::Running,
-            Status::Complete => Member::Complete,
-            Status::Error => {
-                let long_ago = now.checked_sub(queue::RETRY_DELAY).unwrap_or(now);
-                let (at, tries) = self
-                    .core
-                    .failures
-                    .get(&id)
-                    .copied()
-                    .unwrap_or((long_ago, 0));
-                Member::Failed { at, tries }
-            }
-        }
-    }
-
     /// Scheduler times, then start what running queues allow (notes/ENGINE.md §5).
     fn tick_queues(&mut self) {
-        use chrono::Datelike;
-        let now_s = seconds_now();
-        let prev = std::mem::replace(&mut self.core.clock, now_s);
-        let today = chrono::Local::now().date_naive();
-        let weekday = today.weekday().num_days_from_sunday() as usize;
-        let date = (today.year(), today.month(), today.day());
-        for q in 0..self.core.queues.len() {
-            let sch = self.core.queues[q].schedule.clone();
-            if let Some(t) = sch.start_at
-                && sch.starts_on(date, weekday)
-                && queue::crossed(t, prev, now_s)
-            {
-                self.core.queues[q].running = true;
-            }
-            if let Some(t) = sch.stop_at
-                && queue::crossed(t, prev, now_s)
-            {
-                self.stop_queue(q);
+        use mdm_core::session::TickEffect;
+        for effect in self.core.tick_queues() {
+            match effect {
+                TickEffect::Start(id) => self.start(id, false),
+                TickEffect::QueueDone(q) => self.queue_done(q),
             }
         }
-        let now = Instant::now();
-        for q in 0..self.core.queues.len() {
-            if !self.core.queues[q].running {
-                continue;
-            }
-            // Each download's standing, looked up once (a linear search per queued id before).
-            let members = self.members(now);
-            let starts = queue::to_start(&self.core.queues[q], |id| member_in(&members, id), now);
-            for id in starts {
-                self.start(id, false);
-            }
-            let members = self.members(now);
-            if queue::finished(&self.core.queues[q], |id| member_in(&members, id)) {
-                self.core.queues[q].running = false;
-                self.queue_done(q);
-            }
-        }
-        // The next wake follows the schedules (set again when they change), and a queue that
-        // wakes the computer keeps it awake while it runs (#142).
-        self.core.wake.sync(&self.core.queues);
-        let waking = self
-            .core
-            .queues
-            .iter()
-            .find(|q| q.running && q.schedule.wake)
-            .map(|q| q.name.clone());
-        self.core
-            .wake
-            .keep_awake(waking.is_some(), waking.as_deref().unwrap_or_default());
     }
 
     /// Scheduler → Download limits: stop at the limit, go on when the window has room.
     fn check_limits(&mut self, now: Instant) {
-        self.core
-            .quota
-            .record(now, self.core.items.iter().map(|i| (i.id, i.downloaded)));
-        let s = &self.core.settings;
-        let limit = u64::from(s.limits_mb.max(1)) << 20;
-        let window = Duration::from_secs(u64::from(s.limits_hours.max(1)) * 3600);
-        let change = if s.limits_on {
-            self.core.quota.check(now, limit, window)
-        } else if self.core.quota.blocked {
-            self.core.quota.blocked = false;
-            Some(false)
-        } else {
-            None
-        };
-        match change {
-            Some(true) => {
-                let running: Vec<u64> = self
-                    .core
-                    .items
-                    .iter()
-                    .filter(|i| i.live.is_some())
-                    .map(|i| i.id)
-                    .collect();
-                for id in running {
-                    self.stop(id);
-                    self.core.quota.held.push(id);
+        use mdm_core::session::LimitEffect;
+        for effect in self.core.check_limits(now) {
+            match effect {
+                LimitEffect::Start(id) => self.start(id, false),
+                LimitEffect::Notice { mb, hours, wait } => {
+                    self.limit_notice = Some(dialogs::LimitNotice::new(mb, hours, wait));
                 }
-                for id in self.core.quota.held.clone() {
-                    if let Some(item) = self.item(id) {
-                        item.status = Status::Queued;
-                    }
-                }
-                if self.core.settings.limits_warn {
-                    let wait = self.core.quota.room_in(now, limit, window);
-                    self.limit_notice = Some(dialogs::LimitNotice::new(
-                        self.core.settings.limits_mb,
-                        self.core.settings.limits_hours,
-                        wait,
-                    ));
-                }
-                self.core.dirty = true;
             }
-            Some(false) => {
-                for id in std::mem::take(&mut self.core.quota.held) {
-                    if let Some(item) = self.item(id) {
-                        item.status = Status::Stopped;
-                    }
-                    self.start(id, false);
-                }
-                self.core.dirty = true;
-            }
-            None => {}
         }
     }
 
