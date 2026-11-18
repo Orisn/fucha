@@ -2583,7 +2583,7 @@
 #. text in a download's progress window
 #. label: whether the server lets a stopped download continue (Yes / No)
 	Resume capability	Resume capability
-#. message or event log entry in the main window
+#. message or event log entry in the main window; text in session.rs
 #. event log entry, past tense: the download resumed (just now)
 	Resumed	Resumed
 #. button in the Help menu's windows (About, updates, shortcuts, Tell a friend)
@@ -2951,7 +2951,7 @@
 #. message or event log entry in the main window
 #. {queue} = a queue name such as "Main queue" (keep the braces as they are)
 	Start {queue}	Start {queue}
-#. message or event log entry in the main window
+#. message or event log entry in the main window; text in session.rs
 #. event log entry, past tense: the download started (just now)
 	Started	Started
 #. message or event log entry in the main window

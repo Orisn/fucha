@@ -24,6 +24,7 @@ mdm-tools.workspace = true
 mdm-debrid.workspace = true
 mdm-extract.workspace = true
 mdm-remote.workspace = true
+percent-encoding.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

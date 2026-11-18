@@ -5,11 +5,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
 use egui::{Pos2, Ui, pos2};
-use mdm_engine::Options;
 use mdm_engine::state::state_path;
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 use crate::chrome::{
     self, IconKey, MenuBarEvent, MenuEntry, MenuKind, PopupResult, ShellIcons, ToolbarEvent,
@@ -25,6 +22,7 @@ use crate::settings::Settings;
 use crate::store;
 use crate::winui;
 pub use mdm_core::session::RequestParts;
+pub use mdm_core::session::mark_hook;
 use mdm_core::session::{Core, place_in, take_place};
 use mdm_ipc as ipc;
 
@@ -462,12 +460,6 @@ pub struct App {
     /// Options → Proxy / Socks → Network adapter (#35): the watch, the route seen last frame, and
     /// the downloads stopped because it changed, to start again when it allows.
     netwatch: crate::netwatch::NetWatch,
-    /// Options → Accounts (#44): the debrid accounts downloads go through, and what they were
-    /// set up from (so they are set up again only when that changes).
-    debrid: mdm_debrid::Debrid,
-    debrid_from: u64,
-    route: mdm_engine::Route,
-    adapter_paused: Vec<u64>,
     find: Option<crate::find::Find>,
     /// The last search, for Find Next.
     last_find: Option<crate::find::Query>,
@@ -558,39 +550,6 @@ pub struct App {
     commands: std::sync::mpsc::Receiver<ipc::Incoming>,
 }
 
-/// The login written in an address (`ftp://user:pass@host/…`), decoded.
-fn url_login(url: &url::Url) -> Option<(String, String)> {
-    let password = url.password()?;
-    let decode = |s: &str| {
-        percent_encoding::percent_decode_str(s)
-            .decode_utf8_lossy()
-            .into_owned()
-    };
-    Some((decode(url.username()), decode(password)))
-}
-
-/// `Authorization: Basic …` for "Use authorization".
-/// The Referer a browser would send for `url` from page `referrer` (its default policy,
-/// strict-origin-when-cross-origin): the whole address on the same site, only the site's origin
-/// to another, nothing from https to http.
-fn sent_referrer(url: &url::Url, referrer: &str) -> Option<String> {
-    let from = url::Url::parse(referrer).ok()?;
-    if !matches!(from.scheme(), "http" | "https") {
-        return None;
-    }
-    if from.scheme() == "https" && url.scheme() == "http" {
-        return None;
-    }
-    if from.origin() == url.origin() {
-        let mut full = from.clone();
-        full.set_fragment(None);
-        let _ = full.set_username("");
-        let _ = full.set_password(None);
-        return Some(full.to_string());
-    }
-    Some(format!("{}/", from.origin().ascii_serialization()))
-}
-
 /// What a link found on a page takes along from that page.
 fn page_data_for(link: &str, page: Option<&str>, data: Option<&str>) -> Option<String> {
     let (link, page) = (url::Url::parse(link).ok()?, url::Url::parse(page?).ok()?);
@@ -603,23 +562,6 @@ fn page_data_for(link: &str, page: Option<&str>, data: Option<&str>) -> Option<S
     (same_host && !downgrade)
         .then(|| data.map(str::to_owned))
         .flatten()
-}
-
-/// Marks each file the engine starts writing as downloaded from the web (Mark-of-the-Web, macOS'
-/// quarantine: win32 / unix `mark_downloaded`), as browsers mark theirs. Only http(s) addresses
-/// (an FTP address may carry its login).
-pub(crate) fn mark_hook(url: &url::Url, referrer: Option<&str>) -> mdm_engine::FileHook {
-    let web = matches!(url.scheme(), "http" | "https");
-    let (url, referrer) = (url.to_string(), referrer.map(str::to_owned));
-    mdm_engine::FileHook::new(move |path: &std::path::Path| {
-        if !web {
-            return;
-        }
-        #[cfg(windows)]
-        crate::win32::mark_downloaded(path, &url, referrer.as_deref());
-        #[cfg(unix)]
-        crate::unix::mark_downloaded(path, &url, referrer.as_deref());
-    })
 }
 
 /// The Google Drive file whose player the browser's video button was clicked over (#34): the
@@ -654,17 +596,6 @@ fn drive_file_behind_player(cmd: &ipc::Command) -> Option<String> {
         .as_deref()
         .filter(|r| googles == Some(true) && drive_file(r))
         .map(str::to_owned)
-}
-
-pub fn auth_headers(login: Option<&(String, String)>) -> HeaderMap {
-    let mut h = HeaderMap::new();
-    if let Some((user, pass)) = login {
-        let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
-        if let Ok(v) = HeaderValue::from_str(&format!("Basic {token}")) {
-            h.insert(AUTHORIZATION, v);
-        }
-    }
-    h
 }
 
 /// Seconds since local midnight (for queue schedules).
@@ -933,6 +864,10 @@ impl App {
                 quota: Default::default(),
                 failures: HashMap::new(),
                 stopped_by_hand: Default::default(),
+                debrid: Default::default(),
+                debrid_from: 0,
+                route: mdm_engine::Route::Any,
+                adapter_paused: Vec::new(),
             },
             selection: Default::default(),
             view,
@@ -1012,10 +947,6 @@ impl App {
             remote_torrents: Vec::new(),
             free_space: Default::default(),
             netwatch: Default::default(),
-            debrid: Default::default(),
-            debrid_from: 0,
-            route: mdm_engine::Route::Any,
-            adapter_paused: Vec::new(),
             find: None,
             last_find: None,
             notice: None,
@@ -1601,65 +1532,29 @@ impl App {
     /// (the API calls take the same proxy, DNS and adapter), changed; then the services' host
     /// lists read, off the window's thread. No account: no request at all.
     fn debrid_tick(&mut self) {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        for a in self
-            .core
-            .settings
-            .debrid_accounts
-            .iter()
-            .filter(|a| a.enabled)
-        {
-            (a.id, a.service, &a.secret).hash(&mut h);
-        }
-        format!("{:?}", crate::settings::own_net().proxy).hash(&mut h);
-        self.core.settings.dns().hash(&mut h);
-        self.route.hash(&mut h);
-        let from = h.finish();
-        if from == self.debrid_from {
-            return;
-        }
-        self.debrid_from = from;
-        let accounts: Vec<mdm_debrid::Account> = self
-            .core
-            .settings
-            .debrid_accounts
-            .iter()
-            .filter(|a| a.enabled)
-            .filter_map(crate::settings::DebridAccount::account)
-            .collect();
-        let Ok(http) = crate::debrid::http() else {
-            return;
-        };
-        let any = !accounts.is_empty();
-        self.debrid.set_accounts(accounts, http);
-        if any {
-            let debrid = self.debrid.clone();
-            self.core.rt.spawn(async move {
-                if let Err(e) = debrid.refresh_hosts().await {
-                    tracing::warn!("debrid host lists: {e:?}");
-                }
-            });
-        }
+        self.core.debrid_tick();
     }
 
     /// Which account downloads go through (#44), for the windows that show and change it.
     pub fn debrid_route(&self) -> crate::debrid::Route {
-        crate::debrid::Route::new(&self.debrid, &self.core.settings)
+        self.core.debrid_route()
     }
 
     fn network_adapter_tick(&mut self, ctx: &egui::Context) {
         let route = self.netwatch.route(&self.core.settings.net_adapter, ctx);
         crate::settings::share_route(route.clone());
-        if route != self.route {
-            let before = std::mem::replace(&mut self.route, route.clone());
+        if route != self.core.route {
+            let before = std::mem::replace(&mut self.core.route, route.clone());
             self.route_changed(&before);
         }
-        if matches!(self.route, mdm_engine::Route::Down { .. }) || self.adapter_paused.is_empty() {
+        if matches!(self.core.route, mdm_engine::Route::Down { .. })
+            || self.core.adapter_paused.is_empty()
+        {
             return;
         }
         // Started again once their jobs have ended.
         let ready: Vec<u64> = self
+            .core
             .adapter_paused
             .iter()
             .copied()
@@ -1670,7 +1565,8 @@ impl App {
                     .any(|i| i.id == *id && i.live.is_none())
             })
             .collect();
-        self.adapter_paused
+        self.core
+            .adapter_paused
             .retain(|id| self.core.items.iter().any(|i| i.id == *id) && !ready.contains(id));
         for id in ready {
             self.start(id, false);
@@ -1678,7 +1574,7 @@ impl App {
     }
 
     fn route_changed(&mut self, before: &mdm_engine::Route) {
-        let note = match &self.route {
+        let note = match &self.core.route {
             mdm_engine::Route::Down { label } => crate::i18n::fmt(
                 // i18n: event log entry: the download stopped because the chosen network adapter (a VPN's, usually) went away; {adapter} its name
                 crate::i18n::t("Stopped: {adapter} is not connected; it goes on when it is back"),
@@ -1696,12 +1592,12 @@ impl App {
             }
         }
         for id in stopped {
-            if !self.adapter_paused.contains(&id) {
-                self.adapter_paused.push(id);
+            if !self.core.adapter_paused.contains(&id) {
+                self.core.adapter_paused.push(id);
             }
         }
         // The torrent session's sockets were bound as things were.
-        if !before.is_any() || !self.route.is_any() {
+        if !before.is_any() || !self.core.route.is_any() {
             self.torrent_host.stop_now(&self.core.rt);
         }
         self.core.dirty = true;
@@ -2360,57 +2256,7 @@ impl App {
         context: &ipc::Command,
         direct: bool,
     ) -> RequestParts {
-        let site_login = self.core.settings.site_login(url);
-        let url_login = mdm_engine::ftp::is_ftp(url)
-            .then(|| url_login(url))
-            .flatten();
-        let mut headers = auth_headers(login.or(site_login.as_ref()).or(url_login.as_ref()));
-        let post_type = context.post.as_ref().and(context.post_type.as_ref());
-        let referer = context
-            .referer
-            .as_deref()
-            .and_then(|r| sent_referrer(url, r));
-        for (name, v) in [
-            (reqwest::header::REFERER, &referer),
-            (reqwest::header::COOKIE, &context.cookies),
-            (reqwest::header::CONTENT_TYPE, &post_type.cloned()),
-        ] {
-            if let Some(v) = v.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
-                headers.insert(name, v);
-            }
-        }
-        let ua = self.core.settings.user_agent.trim();
-        let opts = Options {
-            max_connections: self.core.settings.connections_for(url),
-            proxy: self.core.settings.proxy_for(context),
-            dns: self.core.settings.dns(),
-            route: self.route.clone(),
-            // Through a debrid account when one takes this host (#44).
-            unlocker: self.debrid_route().unlocker(url, direct),
-            global: Some(self.core.global.clone()),
-            host_limits: Some(self.core.host_limits.clone()),
-            ignore_mtime: self.core.settings.ignore_mtime,
-            server_time: self.core.settings.set_creation_date,
-            ftp_passive: self.core.settings.ftp_passive,
-            user_agent: match context.user_agent.as_deref() {
-                Some(browser) => browser.to_owned(),
-                None if ua.is_empty() => Options::default().user_agent,
-                None => ua.to_owned(),
-            },
-            // The browser's User-Agent may be refused on this connection (#372): MDM's own
-            // (Options' or the default) is tried once then, as Add URL would.
-            agent_fallback: context.user_agent.is_some().then(|| {
-                if ua.is_empty() {
-                    Options::default().user_agent
-                } else {
-                    ua.to_owned()
-                }
-            }),
-            post: context.post.clone().map(|body| body.into_bytes().into()),
-            on_file_created: Some(mark_hook(url, context.referer.as_deref())),
-            ..Options::default()
-        };
-        RequestParts { headers, opts }
+        self.core.request_parts(url, login, context, direct)
     }
 
     /// Before a download starts: into a free place of its own if its own is another row's
@@ -3564,7 +3410,7 @@ impl App {
     /// through the first account", with an account there.
     fn torrent_account(&self) -> Option<(u64, mdm_debrid::ServiceKind)> {
         (self.core.settings.debrid_on && self.core.settings.debrid_torrents)
-            .then(|| self.debrid.torrent_account())
+            .then(|| self.core.debrid.torrent_account())
             .flatten()
     }
 
@@ -3637,7 +3483,7 @@ impl App {
         let rt = self.core.rt.clone();
         let _guard = rt.enter();
         let job = mdm_debrid::torrents::RemoteTorrent::start(
-            &self.debrid,
+            &self.core.debrid,
             mdm_debrid::torrents::Order {
                 account: spec.account,
                 magnet: url,
@@ -8729,7 +8575,7 @@ mod global_cap_tests {
 
 #[cfg(test)]
 mod referrer_tests {
-    use super::sent_referrer;
+    use mdm_core::session::sent_referrer;
 
     #[test]
     fn referrers_as_browsers_send_them() {

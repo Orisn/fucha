@@ -12,7 +12,7 @@ use mdm_engine::limiter::Limiter;
 use mdm_engine::state::state_path;
 use mdm_engine::{Destination, Download, KeptAnswer, Options, Request};
 use mdm_ipc as ipc;
-use reqwest::header::HeaderMap;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 use crate::layout::Layout;
 use crate::model::{Category, Item, Job, Live, Status};
@@ -47,6 +47,12 @@ pub struct Core {
     /// Stopped by hand while they could have run: a running queue leaves them alone until
     /// they are started again or the queue is started anew (#341).
     pub stopped_by_hand: HashSet<u64>,
+    /// Options → Accounts (#44): the debrid accounts downloads go through, and what they were
+    /// set up from (so they are set up again only when that changes).
+    pub debrid: mdm_debrid::Debrid,
+    pub debrid_from: u64,
+    pub route: mdm_engine::Route,
+    pub adapter_paused: Vec<u64>,
 }
 
 /// What an automation action asks the window to do once the core has decided it: starting or
@@ -96,7 +102,64 @@ pub struct RequestParts {
     pub opts: Options,
 }
 
-/// A free place for `name` in `dir`, numbered when it is taken (`file (1).ext`…).
+/// The login written in an address (`ftp://user:pass@host/…`), decoded.
+pub fn url_login(url: &url::Url) -> Option<(String, String)> {
+    let password = url.password()?;
+    let decode = |s: &str| {
+        percent_encoding::percent_decode_str(s)
+            .decode_utf8_lossy()
+            .into_owned()
+    };
+    Some((decode(url.username()), decode(password)))
+}
+
+/// `Authorization: Basic …` for "Use authorization".
+pub fn auth_headers(login: Option<&(String, String)>) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    if let Some((user, pass)) = login {
+        use base64::Engine as _;
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        if let Ok(v) = HeaderValue::from_str(&format!("Basic {token}")) {
+            h.insert(AUTHORIZATION, v);
+        }
+    }
+    h
+}
+
+/// The Referer a browser would send for `url` from page `referrer` (its default policy,
+/// strict-origin-when-cross-origin): the whole address on the same site, only the site's origin
+/// to another, nothing from https to http.
+pub fn sent_referrer(url: &url::Url, referrer: &str) -> Option<String> {
+    let from = url::Url::parse(referrer).ok()?;
+    if !matches!(from.scheme(), "http" | "https") {
+        return None;
+    }
+    if from.scheme() == "https" && url.scheme() == "http" {
+        return None;
+    }
+    if from.origin() == url.origin() {
+        let mut full = from.clone();
+        full.set_fragment(None);
+        let _ = full.set_username("");
+        let _ = full.set_password(None);
+        return Some(full.to_string());
+    }
+    Some(format!("{}/", from.origin().ascii_serialization()))
+}
+
+/// Marks each file the engine starts writing as downloaded from the web (Mark-of-the-Web, macOS'
+/// quarantine), as browsers mark theirs. Only http(s) addresses (an FTP address may carry its
+/// login).
+pub fn mark_hook(url: &url::Url, referrer: Option<&str>) -> mdm_engine::FileHook {
+    let web = matches!(url.scheme(), "http" | "https");
+    let (url, referrer) = (url.to_string(), referrer.map(str::to_owned));
+    mdm_engine::FileHook::new(move |path: &Path| {
+        if !web {
+            return;
+        }
+        mdm_platform::mark_downloaded(path, &url, referrer.as_deref());
+    })
+}
 pub fn place_in(dir: &Path, name: &str, taken: &mut HashSet<PathBuf>) -> PathBuf {
     let (stem, ext) = match name.rfind('.') {
         Some(i) if i > 0 => (&name[..i], &name[i..]),
@@ -169,6 +232,112 @@ pub fn place_to_take(item: &Item, items: &[Item]) -> Option<PathBuf> {
 }
 
 impl Core {
+    /// Which account a download goes through (#44).
+    pub fn debrid_route(&self) -> crate::debrid::Route {
+        crate::debrid::Route::new(&self.debrid, &self.settings)
+    }
+
+    /// What a download's requests carry: its headers (a login, the browser's Referer and
+    /// Cookie, a form's Content-Type) and the options its requests go with (User-Agent, proxy, a
+    /// form's body). Download File Info's look-up asks with the same as the download.
+    pub fn request_parts(
+        &self,
+        url: &url::Url,
+        login: Option<&(String, String)>,
+        context: &ipc::Command,
+        direct: bool,
+    ) -> RequestParts {
+        let site_login = self.settings.site_login(url);
+        let url_login = mdm_engine::ftp::is_ftp(url)
+            .then(|| url_login(url))
+            .flatten();
+        let mut headers = auth_headers(login.or(site_login.as_ref()).or(url_login.as_ref()));
+        let post_type = context.post.as_ref().and(context.post_type.as_ref());
+        let referer = context
+            .referer
+            .as_deref()
+            .and_then(|r| sent_referrer(url, r));
+        for (name, v) in [
+            (reqwest::header::REFERER, &referer),
+            (reqwest::header::COOKIE, &context.cookies),
+            (reqwest::header::CONTENT_TYPE, &post_type.cloned()),
+        ] {
+            if let Some(v) = v.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
+                headers.insert(name, v);
+            }
+        }
+        let ua = self.settings.user_agent.trim();
+        let opts = Options {
+            max_connections: self.settings.connections_for(url),
+            proxy: self.settings.proxy_for(context),
+            dns: self.settings.dns(),
+            route: self.route.clone(),
+            // Through a debrid account when one takes this host (#44).
+            unlocker: self.debrid_route().unlocker(url, direct),
+            global: Some(self.global.clone()),
+            host_limits: Some(self.host_limits.clone()),
+            ignore_mtime: self.settings.ignore_mtime,
+            server_time: self.settings.set_creation_date,
+            ftp_passive: self.settings.ftp_passive,
+            user_agent: match context.user_agent.as_deref() {
+                Some(browser) => browser.to_owned(),
+                None if ua.is_empty() => Options::default().user_agent,
+                None => ua.to_owned(),
+            },
+            // The browser's User-Agent may be refused on this connection (#372): MDM's own
+            // (Options' or the default) is tried once then, as Add URL would.
+            agent_fallback: context.user_agent.is_some().then(|| {
+                if ua.is_empty() {
+                    Options::default().user_agent
+                } else {
+                    ua.to_owned()
+                }
+            }),
+            post: context.post.clone().map(|body| body.into_bytes().into()),
+            on_file_created: Some(mark_hook(url, context.referer.as_deref())),
+            ..Options::default()
+        };
+        RequestParts { headers, opts }
+    }
+
+    /// Options → Accounts (#44): set the debrid accounts up again when the settings or the
+    /// network adapter changed.
+    pub fn debrid_tick(&mut self) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for a in self.settings.debrid_accounts.iter().filter(|a| a.enabled) {
+            (a.id, a.service, &a.secret).hash(&mut h);
+        }
+        format!("{:?}", crate::settings::own_net().proxy).hash(&mut h);
+        self.settings.dns().hash(&mut h);
+        self.route.hash(&mut h);
+        let from = h.finish();
+        if from == self.debrid_from {
+            return;
+        }
+        self.debrid_from = from;
+        let accounts: Vec<mdm_debrid::Account> = self
+            .settings
+            .debrid_accounts
+            .iter()
+            .filter(|a| a.enabled)
+            .filter_map(crate::settings::DebridAccount::account)
+            .collect();
+        let Ok(http) = crate::debrid::http() else {
+            return;
+        };
+        let any = !accounts.is_empty();
+        self.debrid.set_accounts(accounts, http);
+        if any {
+            let debrid = self.debrid.clone();
+            self.rt.spawn(async move {
+                if let Err(e) = debrid.refresh_hosts().await {
+                    tracing::warn!("debrid host lists: {e:?}");
+                }
+            });
+        }
+    }
+
     /// The automation API's list: every download as JSON, with its queues and categories.
     pub fn list_answer(&self, remote: bool, free: Option<u64>) -> String {
         use ipc::api::{DownloadInfo, ListAnswer, line};

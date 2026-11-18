@@ -4,6 +4,7 @@
 //! may depend on egui or on a window.
 
 pub mod countries;
+pub mod debrid;
 pub mod errors;
 pub mod i18n;
 pub mod layout;
