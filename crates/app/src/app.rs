@@ -26,16 +26,7 @@ use crate::store;
 use crate::winui;
 use mdm_ipc as ipc;
 
-/// A node of the Categories tree, what the list shows (saved: the last one comes back).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) enum View {
-    All,
-    Cat(Category),
-    Unfinished(Option<Category>),
-    Finished(Option<Category>),
-    /// A queue (index into `App::queues`).
-    Queue(usize),
-}
+pub use mdm_core::ui::View;
 
 /// What was being added when its address turned out to be in the list already.
 enum Pending {

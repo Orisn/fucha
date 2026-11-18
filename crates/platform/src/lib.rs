@@ -62,6 +62,91 @@ pub fn offscreen() -> bool {
     *ON.get_or_init(|| std::env::var_os("MDM_OFFSCREEN").is_some_and(|v| v == "1"))
 }
 
+/// Options → Sites Logins' passwords, encrypted for this Windows account (DPAPI) before the list
+/// is written: another account, or a copy of the file, can't read them.
+#[cfg(windows)]
+pub fn protect(plain: &str) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Security::Cryptography::{CRYPT_INTEGER_BLOB, CryptProtectData};
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: u32::try_from(plain.len()).ok()?,
+        pbData: plain.as_ptr().cast_mut(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    // SAFETY: `input` points at `plain` for the call (only read); `output` is filled by the
+    // system with a buffer we copy and then free with LocalFree, as CryptProtectData requires.
+    let ok = unsafe {
+        CryptProtectData(
+            &input,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            &mut output,
+        )
+    };
+    blob_bytes(ok, output)
+}
+
+/// The password `protect` encrypted, for this account.
+#[cfg(windows)]
+pub fn unprotect(sealed: &[u8]) -> Option<String> {
+    use windows_sys::Win32::Security::Cryptography::{CRYPT_INTEGER_BLOB, CryptUnprotectData};
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: u32::try_from(sealed.len()).ok()?,
+        pbData: sealed.as_ptr().cast_mut(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    // SAFETY: as in `protect`.
+    let ok = unsafe {
+        CryptUnprotectData(
+            &input,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            &mut output,
+        )
+    };
+    String::from_utf8(blob_bytes(ok, output)?).ok()
+}
+
+/// Elsewhere the account's keychain keeps the sign-in secrets (mdm-app's secrets.rs), so nothing
+/// is sealed here.
+#[cfg(not(windows))]
+pub fn protect(_plain: &str) -> Option<Vec<u8>> {
+    None
+}
+
+/// Nothing was sealed here (`protect`).
+#[cfg(not(windows))]
+pub fn unprotect(_sealed: &[u8]) -> Option<String> {
+    None
+}
+
+/// A DPAPI result's bytes, its buffer freed.
+#[cfg(windows)]
+fn blob_bytes(
+    ok: i32,
+    blob: windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
+) -> Option<Vec<u8>> {
+    if ok == 0 || blob.pbData.is_null() {
+        return None;
+    }
+    // SAFETY: the system gave `cbData` bytes at `pbData`, ours until LocalFree.
+    let bytes = unsafe { std::slice::from_raw_parts(blob.pbData, blob.cbData as usize) }.to_vec();
+    // SAFETY: the buffer came from DPAPI, which allocates with LocalAlloc.
+    unsafe { windows_sys::Win32::Foundation::LocalFree(blob.pbData.cast()) };
+    Some(bytes)
+}
+
 /// Mark-of-the-Web on a file being downloaded from `url` (`referrer`'s page): the zone stream
 /// browsers write, so SmartScreen checks a program, Office opens a document in Protected View and
 /// archive tools pass the mark on, as for the browser's own download. Written on the part file

@@ -25,42 +25,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use serde::{Deserialize, Serialize};
-
-/// A choice of View → Draw with, as saved in the settings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Api {
-    #[serde(rename = "opengl")]
-    OpenGl,
-    #[serde(rename = "direct3d")]
-    Direct3D,
-    #[serde(rename = "vulkan")]
-    Vulkan,
-    #[serde(rename = "metal")]
-    Metal,
-}
-
-impl Api {
-    /// Its name in the log and the crash reports (the menu's are translated texts, app.rs).
-    pub fn name(self) -> &'static str {
-        match self {
-            Api::OpenGl => "OpenGL",
-            Api::Direct3D => "Direct3D 12",
-            Api::Vulkan => "Vulkan",
-            Api::Metal => "Metal",
-        }
-    }
-
-    /// The first part of its files' names in the data folder (`direct3d-failed.txt`…).
-    fn key(self) -> &'static str {
-        match self {
-            Api::OpenGl => "opengl",
-            Api::Direct3D => "direct3d",
-            Api::Vulkan => "vulkan",
-            Api::Metal => "metal",
-        }
-    }
-}
+pub use mdm_core::ui::RendererApi as Api;
 
 /// The system's own graphics API, through wgpu (build.rs sets `gpu` where wgpu is built):
 /// Direct3D 12 on Windows, Vulkan on Linux, Metal on macOS. None elsewhere (the BSDs: OpenGL
