@@ -14,51 +14,13 @@ use mdm_engine::Snapshot;
 use mdm_engine::download::State;
 use mdm_torrent::{Config, Phase, Torrents};
 
-pub use mdm_core::torrent::{BLOCKLIST_FILE, SharingLimits, route_bind};
+pub use mdm_core::session::{Reached, share_ratio, sharing_limit_reached};
+pub use mdm_core::torrent::{BLOCKLIST_FILE, route_bind};
 pub use mdm_core::torrent_spec::TorrentSpec;
-
-/// Which seeding limit a finished torrent reached.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Reached {
-    /// The share ratio it reached.
-    Ratio(f64),
-    /// The seconds it shared.
-    Time(u64),
-}
-
-/// Whether `spec`, with `done` bytes there, has reached a seeding limit (the ratio first).
-pub fn sharing_limit_reached(
-    spec: &TorrentSpec,
-    done: u64,
-    limits: SharingLimits,
-) -> Option<Reached> {
-    let ratio = share_ratio(spec.uploaded, done);
-    if let Some(r) = limits.ratio
-        && done > 0
-        && ratio >= r
-    {
-        return Some(Reached::Ratio(ratio));
-    }
-    if let Some(s) = limits.secs
-        && spec.seeded_secs >= s
-    {
-        return Some(Reached::Time(spec.seeded_secs));
-    }
-    None
-}
 
 /// No session is running: nothing is connected, whatever the list last showed (#357).
 pub fn clear_peers<'a>(specs: impl Iterator<Item = &'a mut TorrentSpec>) {
     specs.for_each(|t| t.peers = 0);
-}
-
-/// A torrent's share ratio: what it sent to peers against what it has. Zero while it has nothing.
-pub fn share_ratio(sent: u64, done: u64) -> f64 {
-    if done == 0 {
-        0.0
-    } else {
-        sent as f64 / done as f64
-    }
 }
 
 /// [`share_ratio`] as the interface writes it, in the list and the progress window's General tab:
@@ -1007,6 +969,7 @@ pub fn dest_for(meta: &mdm_torrent::Meta, dir: &Path, files: Option<&[usize]>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mdm_core::torrent::SharingLimits;
 
     fn a_spec() -> TorrentSpec {
         TorrentSpec {

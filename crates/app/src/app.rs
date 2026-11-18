@@ -15,7 +15,7 @@ use crate::chrome::{
 use crate::dialogs::{self, AddUrl, Complete, FileInfo, Outcome, Start};
 use crate::icons::Icon;
 use crate::list;
-use crate::model::{self, Category, Item, Live, Status};
+use crate::model::{self, Category, Item, Status};
 use crate::progress::{self, Progress};
 use crate::queue::Queue;
 use crate::settings::Settings;
@@ -1543,64 +1543,14 @@ impl App {
     fn network_adapter_tick(&mut self, ctx: &egui::Context) {
         let route = self.netwatch.route(&self.core.settings.net_adapter, ctx);
         crate::settings::share_route(route.clone());
-        if route != self.core.route {
-            let before = std::mem::replace(&mut self.core.route, route.clone());
-            self.route_changed(&before);
-        }
-        if matches!(self.core.route, mdm_engine::Route::Down { .. })
-            || self.core.adapter_paused.is_empty()
-        {
-            return;
-        }
-        // Started again once their jobs have ended.
-        let ready: Vec<u64> = self
-            .core
-            .adapter_paused
-            .iter()
-            .copied()
-            .filter(|id| {
-                self.core
-                    .items
-                    .iter()
-                    .any(|i| i.id == *id && i.live.is_none())
-            })
-            .collect();
-        self.core
-            .adapter_paused
-            .retain(|id| self.core.items.iter().any(|i| i.id == *id) && !ready.contains(id));
-        for id in ready {
-            self.start(id, false);
-        }
-    }
-
-    fn route_changed(&mut self, before: &mdm_engine::Route) {
-        let note = match &self.core.route {
-            mdm_engine::Route::Down { label } => crate::i18n::fmt(
-                // i18n: event log entry: the download stopped because the chosen network adapter (a VPN's, usually) went away; {adapter} its name
-                crate::i18n::t("Stopped: {adapter} is not connected; it goes on when it is back"),
-                &[("adapter", label)],
-            ),
-            // i18n: event log entry: the download stopped to start again through the network adapter as it is now (a VPN reconnected, another adapter chosen)
-            _ => crate::i18n::t("Stopped: the network adapter changed; starting again").to_owned(),
-        };
-        let mut stopped = Vec::new();
-        for i in &mut self.core.items {
-            if let Some(l) = &i.live {
-                l.dl.cancel();
-                i.note(note.clone());
-                stopped.push(i.id);
-            }
-        }
-        for id in stopped {
-            if !self.core.adapter_paused.contains(&id) {
-                self.core.adapter_paused.push(id);
-            }
-        }
+        let effect = self.core.route_tick(route);
         // The torrent session's sockets were bound as things were.
-        if !before.is_any() || !self.core.route.is_any() {
+        if effect.torrent_restart {
             self.torrent_host.stop_now(&self.core.rt);
         }
-        self.core.dirty = true;
+        for id in effect.starts {
+            self.start(id, false);
+        }
     }
 
     /// Every 2 s (#40): Torrent settings for the next torrent session, and the running one stopped
@@ -2116,9 +2066,7 @@ impl App {
         }
         // Its menu: never on this site.
         if let Some(host) = cmd.panel_hide_site.as_deref() {
-            self.core.settings.video_panel_sites =
-                mdm_ipc::capture::add_site(&self.core.settings.video_panel_sites, host);
-            self.core.dirty = true;
+            self.core.hide_video_panel_site(host);
             return;
         }
         // The browser's right-click menu: a page's (or a selection's) links, to tick in Import.
@@ -2142,9 +2090,7 @@ impl App {
         }
         // The browser's toolbar button: this site's downloads stay with the browser.
         if let Some(host) = cmd.exclude_site.as_deref() {
-            self.core.settings.excluded_sites =
-                mdm_ipc::capture::add_site(&self.core.settings.excluded_sites, host);
-            self.core.dirty = true;
+            self.core.exclude_site(host);
             return;
         }
         if cmd.start_queue {
@@ -2257,12 +2203,6 @@ impl App {
         direct: bool,
     ) -> RequestParts {
         self.core.request_parts(url, login, context, direct)
-    }
-
-    /// Before a download starts: into a free place of its own if its own is another row's
-    /// (`place_to_take`). The name stays the address's guess if it was one.
-    fn claim_place(&mut self, id: u64) {
-        self.core.claim_place(id);
     }
 
     /// Start or resume a download; `show` opens its progress dialog (IDM's default).
@@ -3167,63 +3107,9 @@ impl App {
 
     /// Start a video item: yt-dlp (installed and verified) downloads it.
     fn start_video(&mut self, id: u64, show: bool) {
-        self.claim_place(id);
-        let tools = mdm_tools::tools_dir();
-        let tool = tools.as_deref().and_then(mdm_tools::installed);
-        let ffmpeg = tools.as_deref().and_then(mdm_tools::ffmpeg::installed);
-        let rate = self.core.settings.speed_limit();
-        let Some(item) = self.item(id) else { return };
-        let Some(spec) = item.video.clone() else {
+        if !self.core.start_video(id) {
             return;
-        };
-        let Some(tool) = tool else {
-            item.status = Status::Error;
-            item.error = Some(
-                crate::i18n::t(
-                    "yt-dlp is not installed (Tasks → Download video from a page installs it)",
-                )
-                .into(),
-            );
-            self.core.dirty = true;
-            return;
-        };
-        let folder = item.dest.parent().map(PathBuf::from).unwrap_or_default();
-        let stem = item
-            .dest
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "video".into());
-        let _ = std::fs::create_dir_all(&folder);
-        let started = mdm_tools::video::VideoJob::start(
-            &tool.exe,
-            item.url.as_str(),
-            &spec.selector,
-            &folder,
-            &stem,
-            rate,
-            ffmpeg.as_ref().map(|f| f.exe.as_path()),
-            item.size,
-            &crate::videodlg::from_browser(&item.context),
-            &spec.subs,
-        );
-        match started {
-            Ok(job) => {
-                item.note(crate::i18n::fmt(
-                    crate::i18n::t("Started with yt-dlp {version} ({format})"),
-                    &[("version", &tool.version), ("format", &spec.selector)],
-                ));
-                let url = item.url.clone();
-                item.live = Some(Live::new(model::Job::Video { job, url }, item.downloaded));
-                item.status = Status::Downloading;
-                item.error = None;
-                item.last_try = Some(model::now_stamp());
-            }
-            Err(e) => {
-                item.status = Status::Error;
-                item.error = Some(e.to_string());
-            }
         }
-        self.core.dirty = true;
         if show && !self.progress.iter().any(|p| p.id == id) {
             self.progress
                 .push(Progress::new(id, self.core.settings.show_complete));
@@ -3259,59 +3145,9 @@ impl App {
 
     /// Start (or start again) a gallery: gallery-dl, installed and verified, or the person's.
     fn start_gallery(&mut self, id: u64, show: bool) {
-        let tool = mdm_tools::tools_dir()
-            .as_deref()
-            .and_then(mdm_tools::gallery::installed);
-        let rate = self.core.settings.speed_limit();
-        let Some(item) = self.item(id) else { return };
-        let Some(spec) = item.gallery.clone() else {
+        if !self.core.start_gallery(id) {
             return;
-        };
-        let Some(tool) = tool else {
-            item.status = Status::Error;
-            item.error = Some(
-                crate::i18n::t(
-                    // i18n: a gallery download's error: the helper program it needs is missing
-                    "gallery-dl is not installed (Add URL with a gallery's address installs it)",
-                )
-                .into(),
-            );
-            self.core.dirty = true;
-            return;
-        };
-        let ask = mdm_tools::gallery::Ask {
-            limit: spec.limit,
-            rate,
-        };
-        let started = mdm_tools::gallery::GalleryJob::start(
-            &tool,
-            item.url.as_str(),
-            &item.dest,
-            &ask,
-            &crate::videodlg::from_browser(&item.context),
-        );
-        match started {
-            Ok(job) => {
-                item.note(crate::i18n::fmt(
-                    // i18n: a gallery download's log: {version} = gallery-dl's version
-                    crate::i18n::t("Started with gallery-dl {version}"),
-                    &[("version", &tool.version)],
-                ));
-                let url = item.url.clone();
-                // A gallery counts what it saves this run.
-                item.downloaded = 0;
-                item.size = None;
-                item.live = Some(Live::new(model::Job::Gallery { job, url }, 0));
-                item.status = Status::Downloading;
-                item.error = None;
-                item.last_try = Some(model::now_stamp());
-            }
-            Err(e) => {
-                item.status = Status::Error;
-                item.error = Some(e.to_string());
-            }
         }
-        self.core.dirty = true;
         if show && !self.progress.iter().any(|p| p.id == id) {
             self.progress
                 .push(Progress::new(id, self.core.settings.show_complete));
@@ -3329,20 +3165,7 @@ impl App {
 
     /// The hashes librqbit should keep or restore in its session.
     fn session_hashes(&self) -> std::collections::HashSet<String> {
-        let limits = self.core.settings.sharing_limits();
-        self.core
-            .items
-            .iter()
-            .filter(|i| {
-                i.status != Status::Complete
-                    || (self.core.settings.torrent_keep_sharing
-                        && i.torrent.as_ref().is_some_and(|spec| {
-                            crate::torrents::sharing_limit_reached(spec, i.downloaded, limits)
-                                .is_none()
-                        }))
-            })
-            .filter_map(|i| i.torrent.as_ref().map(|t| t.hash.clone()))
-            .collect()
+        self.core.session_hashes()
     }
 
     /// The list's finished torrents (what "keep sharing" shares).
@@ -3568,39 +3391,20 @@ impl App {
 
     /// Start a torrent: the session adds or resumes it.
     fn start_torrent(&mut self, id: u64, show: bool) {
-        let auto_share = self.core.settings.torrent_keep_sharing;
-        let known = self.session_hashes();
-        let limit = self.core.settings.speed_limit();
         let (host, rt) = (self.torrent_host.clone(), self.core.rt.clone());
-        let Some(item) = self.item(id) else { return };
-        // An explicit Start on a completed download means seed it, even when automatic
-        // keep sharing is off. It remains in the session until Stop or a sharing limit.
-        let share = auto_share
-            || item
-                .size
-                .is_some_and(|size| size > 0 && item.downloaded >= size);
-        // Its own remembered limit first, as a file download's (#39).
-        let limit = item.own_limit.or(limit);
-        let Some(spec) = item.torrent.clone() else {
+        let Some(start) = self.core.start_torrent(id) else {
             return;
         };
-        let run =
-            crate::torrents::Run::start(&host, &rt, &spec, item.url.clone(), known, limit, share);
-        item.note(if item.downloaded > 0 {
-            // i18n: event log entry, past tense: the download resumed (just now)
-            crate::i18n::t("Resumed")
-        } else {
-            // i18n: event log entry, past tense: the download started (just now)
-            crate::i18n::t("Started")
-        });
-        item.live = Some(Live::new(
-            model::Job::Torrent(Box::new(run)),
-            item.downloaded,
-        ));
-        item.status = Status::Downloading;
-        item.error = None;
-        item.last_try = Some(model::now_stamp());
-        self.core.dirty = true;
+        let run = crate::torrents::Run::start(
+            &host,
+            &rt,
+            &start.spec,
+            start.url,
+            start.known,
+            start.limit,
+            start.share,
+        );
+        self.core.attach_torrent(id, Box::new(run));
         if show && !self.progress.iter().any(|p| p.id == id) {
             self.progress
                 .push(Progress::new(id, self.core.settings.show_complete));
