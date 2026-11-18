@@ -58,6 +58,26 @@ export interface BrowserIntegration {
   browsers: { name: string; version: string }[];
 }
 
+/** A `mdm://notice` event: something not in the list snapshot itself. */
+export interface MdmNotice {
+  kind:
+    | "limit"
+    | "finished"
+    | "failed"
+    | "save-error"
+    | "queue-started"
+    | "queue-done"
+    | "add-failed";
+  /** The download limit's size and window (`kind: "limit"`). */
+  mb?: number;
+  hours?: number;
+  waitSecs?: number;
+  /** The downloads that finished or failed. */
+  ids?: number[];
+  queue?: string | null;
+  error?: string;
+}
+
 export type Filter =
   | { kind: "all" }
   | { kind: "status"; status: DownloadStatus }
