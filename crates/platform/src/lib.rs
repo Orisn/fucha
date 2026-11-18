@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod keychain;
+
 /// The order of a date's day, month and year.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

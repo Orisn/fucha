@@ -24,5 +24,10 @@ zbus = { version = "5.19.0", default-features = false, features = ["async-io", "
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
 
+# Sign-in secrets in the login keychain (keychain.rs, #44); already in the tree through
+# rustls's platform verifier.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7.0"
+
 [lints]
 workspace = true
