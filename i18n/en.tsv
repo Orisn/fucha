@@ -339,7 +339,7 @@
 	Always into a folder named after it	Always into a folder named after it
 #. checkbox in a dialog box
 	Always turn on Speed Limiter on Mister Download Manager startup	Always turn on Speed Limiter on Mister Download Manager startup
-#. text in regional.rs; text in the Scheduler window
+#. text in the Scheduler window; text in regional.rs
 #. before noon, after a time of day (12-hour clock). Its pair is "PM": write both the same way (this language's own short marks, or both kept as AM and PM)
 	AM	AM
 #. text in countries.rs
@@ -358,7 +358,7 @@
 #. Options → Connection → DNS: a DNS server the user types in
 #. the trailing ... means it is still going on: keep it
 	Another DNS...	Another DNS...
-#. text in unix.rs
+#. text in wake.rs
 #. the Scheduler, under "Wake the computer to run this queue" (Linux): the computer's one wake alarm is already set by something else
 	Another program has set the computer's wake alarm	Another program has set the computer's wake alarm
 #. text in the Options window
@@ -704,7 +704,7 @@
 #. text in countries.rs
 #. a country's name (where a download's server is)
 	Comoros	Comoros
-#. item in the Categories tree in the download list; value in a column's filter list in the download list; text in the download list (sizes, speeds, status); text in a download's progress window; text in remote.rs
+#. item in the Categories tree in the download list; value in a column's filter list in the download list; text in a download's progress window; text in remote.rs; text in the download list (sizes, speeds, status)
 #. a download's status (state it is in, not a command)
 #. a download's status (state it is in, not a command): finished
 	Complete	Complete
@@ -1079,7 +1079,7 @@
 #. text in countries.rs
 #. a country's name (where a download's server is)
 	Eritrea	Eritrea
-#. text in a dialog box; item in the Categories tree in the download list; value in a column's filter list in the download list; text in the download list (sizes, speeds, status); text in remote.rs
+#. text in a dialog box; item in the Categories tree in the download list; value in a column's filter list in the download list; text in remote.rs; text in the download list (sizes, speeds, status)
 #. in Download File Info, where the size goes: the address didn't answer
 #. a download's status (state it is in, not a command)
 #. a download's status (state it is in, not a command): it failed
@@ -1335,10 +1335,10 @@
 #. text in countries.rs
 #. a country's name (where a download's server is)
 	Gambia	Gambia
-#. text in the download list (sizes, speeds, status); text in the Options window; text in a download's progress window
-#. category name: files of no particular kind
+#. text in the Options window; text in a download's progress window; text in the download list (sizes, speeds, status)
 #. tab title: general settings
 #. tab title: general information
+#. category name: files of no particular kind
 	General	General
 #. text in countries.rs
 #. a country's name (where a download's server is)
@@ -2416,7 +2416,7 @@
 #. button in the Options window
 #. verb: plays the sound
 	Play	Play
-#. text in regional.rs; text in the Scheduler window
+#. text in the Scheduler window; text in regional.rs
 #. after noon, after a time of day (12-hour clock). Its pair is "AM": write both the same way (this language's own short marks, or both kept as AM and PM)
 	PM	PM
 #. text in countries.rs
@@ -3002,7 +3002,7 @@
 #. message or event log entry in the main window
 #. {queue} = a queue name such as "Main queue" (keep the braces as they are)
 	Stop {queue}	Stop {queue}
-#. value in a column's filter list in the download list; text in the download list (sizes, speeds, status); text in remote.rs
+#. value in a column's filter list in the download list; text in remote.rs; text in the download list (sizes, speeds, status)
 #. a download's status (state it is in, not a command)
 #. a download's status (state it is in, not a command): stopped by the user
 	Stopped	Stopped
@@ -3238,7 +3238,7 @@
 	The list could not be saved: {error}	The list could not be saved: {error}
 #. text in whereis.rs
 	the local network	the local network
-#. text in errors.rs; text in torrent downloads
+#. text in errors.rs; text in torrent.rs
 #. an error: the network adapter chosen in Options (a VPN's, usually) is off or gone; {adapter} its name
 	the network adapter {adapter} is not connected	the network adapter {adapter} is not connected
 #. text in extracting archives (a download's log, the Archive password window)
@@ -3344,7 +3344,7 @@
 	This code can't be used any more.	This code can't be used any more.
 #. text in whereis.rs
 	this computer	this computer
-#. text in win32.rs
+#. text in wake.rs
 #. the Scheduler, under "Wake the computer to run this queue": Windows set the timer but can't wake this computer with it
 	This computer can't be woken by a timer	This computer can't be woken by a timer
 #. text in errors.rs
@@ -3746,10 +3746,10 @@
 #. remote control page (on a phone): "When" choice: the download waits in a queue; {queue} its name
 #. {queue} = a queue name such as "Main queue" (keep the braces as they are)
 	Wait in {queue}	Wait in {queue}
-#. value in a column's filter list in the download list; text in the download list (sizes, speeds, status); text in a download's progress window
+#. value in a column's filter list in the download list; text in a download's progress window; text in the download list (sizes, speeds, status)
 #. a download's status (state it is in, not a command)
-#. a download's status (state it is in, not a command): waiting in a queue for its turn
 #. a download's status (state it is in, not a command): waiting in a queue
+#. a download's status (state it is in, not a command): waiting in a queue for its turn
 	Waiting	Waiting
 #. text in the Options window
 #. Options → Remote → Pair a device: how long the code stays valid; {time} = minutes:seconds ("9:58")

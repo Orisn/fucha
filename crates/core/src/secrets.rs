@@ -43,6 +43,35 @@ pub trait Pass {
 /// The keychain the app installed; none before [`install`].
 static INSTALLED: OnceLock<Arc<dyn Vault>> = OnceLock::new();
 
+thread_local! {
+    /// A vault for this thread's test only: what `with_test_vault` sets, ahead of the installed
+    /// one. Kept for tests of code that reads the settings.
+    static TEST: std::cell::RefCell<Option<&'static dyn Vault>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The vault in use: this thread's test vault, else the installed one.
+fn current() -> Option<&'static dyn Vault> {
+    TEST.with(|t| *t.borrow())
+        .or_else(|| INSTALLED.get().map(|v| &**v))
+}
+
+/// Runs `f` with `v` as this thread's keychain, ahead of the installed one (tests). The vault is
+/// kept for the process (a leaked box), so what `f` returns may still hold it.
+pub fn with_test_vault<R>(v: Arc<dyn Vault>, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<&'static dyn Vault>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST.with(|t| *t.borrow_mut() = self.0);
+        }
+    }
+    let boxed: &'static Arc<dyn Vault> = Box::leak(Box::new(v));
+    let leaked: &'static dyn Vault = &**boxed;
+    let before = TEST.with(|t| t.replace(Some(leaked)));
+    let _reset = Reset(before);
+    f()
+}
+
 /// Installs the keychain the settings use. The first call wins; later ones are ignored.
 pub fn install(v: Arc<dyn Vault>) {
     let _ = INSTALLED.set(v);
@@ -50,7 +79,7 @@ pub fn install(v: Arc<dyn Vault>) {
 
 /// Whether the settings are being made ready for the disk; false when no vault is installed.
 pub fn is_prepared() -> bool {
-    INSTALLED.get().is_some_and(|v| v.is_prepared())
+    current().is_some_and(|v| v.is_prepared())
 }
 
 /// Runs `f` with the settings made ready for the disk: their secret fields already hold what is
@@ -58,7 +87,7 @@ pub fn is_prepared() -> bool {
 /// read as the disk has them: nothing is opened nor asked of the keychain. Without an installed
 /// vault, just `f`.
 pub fn prepared<R>(f: impl FnOnce() -> R) -> R {
-    let Some(vault) = INSTALLED.get() else {
+    let Some(vault) = current() else {
         return f();
     };
     let mut result = None;
@@ -70,18 +99,18 @@ pub fn prepared<R>(f: impl FnOnce() -> R) -> R {
 
 /// A reference's secret ([`Vault::open`]), or None when no vault is installed.
 pub fn open(stored: &str) -> Option<String> {
-    INSTALLED.get().map(|v| v.open(stored))
+    current().map(|v| v.open(stored))
 }
 
 /// A save's pass over the secrets ([`Vault::pass`]), or None when no vault is installed.
 pub fn pass() -> Option<Box<dyn Pass>> {
-    INSTALLED.get().map(|v| v.pass())
+    current().map(|v| v.pass())
 }
 
 /// The list was written: entries it no longer refers to may go. Nothing without an installed
 /// vault.
 pub fn after_write() {
-    if let Some(vault) = INSTALLED.get() {
+    if let Some(vault) = current() {
         vault.after_write();
     }
 }
@@ -122,25 +151,26 @@ mod tests {
         fn finish(&mut self) {}
     }
 
-    /// The module asks the installed vault for everything, one global for the process.
+    /// The module asks the vault in use for everything; a test's vault is this thread's alone.
     #[test]
-    fn the_installed_vault_answers_every_call() {
-        install(Arc::new(TestVault));
-        // A second install is ignored (the first call wins).
-        install(Arc::new(TestVault));
-        assert!(is_prepared());
-        assert_eq!(
-            open("keychain:a/b/c").as_deref(),
-            Some("opened:keychain:a/b/c")
-        );
-        let mut pass = pass().unwrap();
-        assert_eq!(
-            pass.secret("debrid/1", &|| "label".into(), "s3cret")
-                .as_deref(),
-            Some("debrid/1=s3cret")
-        );
-        pass.finish();
-        assert_eq!(prepared(|| 42), 42);
-        after_write();
+    fn the_threads_vault_answers_every_call() {
+        with_test_vault(Arc::new(TestVault), || {
+            assert!(is_prepared());
+            assert_eq!(
+                open("keychain:a/b/c").as_deref(),
+                Some("opened:keychain:a/b/c")
+            );
+            let mut pass = pass().unwrap();
+            assert_eq!(
+                pass.secret("debrid/1", &|| "label".into(), "s3cret")
+                    .as_deref(),
+                Some("debrid/1=s3cret")
+            );
+            pass.finish();
+            assert_eq!(prepared(|| 42), 42);
+            after_write();
+        });
+        // The test vault is gone from this thread; nothing else is installed here.
+        assert!(!is_prepared());
     }
 }

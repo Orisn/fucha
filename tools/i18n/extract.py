@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from wrap import split_args  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
-SRC = ROOT / "crates" / "app" / "src"
+SRC = [ROOT / "crates" / "app" / "src", ROOT / "crates" / "core" / "src"]
 OUT = ROOT / "i18n" / "en.tsv"
 # The browser extension's texts (its name, description, right-click command): rows of context
 # "extension", which tools/extension/locales.py turns into its _locales.
@@ -350,13 +350,19 @@ def all_sinks(sources):
 
 def collect():
     out = Rows()
-    files = [f for f in sorted(SRC.glob("*.rs")) if f.name != "i18n.rs"]
-    sources = {f.name: f.read_text(encoding="utf-8") for f in files}
+    files = [
+        f
+        for d in SRC
+        for f in sorted(d.glob("*.rs"))
+        if f.name != "i18n.rs"
+    ]
+    sources = {str(f.relative_to(ROOT)): f.read_text(encoding="utf-8") for f in files}
     sinks_of = all_sinks(sources)
     for f in files:
-        s = sources[f.name]
+        key = str(f.relative_to(ROOT))
+        s = sources[key]
         lines = s.split("\n")
-        sinks = sinks_of[f.name]
+        sinks = sinks_of[key]
         sink_call = call_pattern(sinks)
 
         def line_of(pos):

@@ -497,7 +497,7 @@ impl mdm_core::secrets::Vault for Vault {
     }
 
     fn prepared(&self, f: &mut dyn FnMut()) {
-        prepared(|| f());
+        prepared(f);
     }
 
     fn open(&self, stored: &str) -> String {
@@ -592,7 +592,8 @@ pub fn install() {
 #[cfg(test)]
 pub fn with_vault<R>(v: &Arc<Vault>, f: impl FnOnce() -> R) -> R {
     let before = TEST_VAULT.with(|t| t.replace(Some(v.clone())));
-    let r = f();
+    let core_vault: Arc<dyn mdm_core::secrets::Vault> = v.clone();
+    let r = mdm_core::secrets::with_test_vault(core_vault, f);
     TEST_VAULT.with(|t| *t.borrow_mut() = before);
     r
 }

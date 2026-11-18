@@ -3873,17 +3873,6 @@ pub fn host_registration() -> crate::extension::Registration {
     broken.map_or(Registration::Missing, Registration::HelperMissing)
 }
 
-/// Options → Sites Logins' passwords, encrypted for this Windows account (DPAPI) before the list
-/// is written: another account, or a copy of the file, can't read them. `mdm-platform`'s.
-pub fn protect(plain: &str) -> Option<Vec<u8>> {
-    mdm_platform::protect(plain)
-}
-
-/// The password `protect` encrypted, for this account.
-pub fn unprotect(sealed: &[u8]) -> Option<String> {
-    mdm_platform::unprotect(sealed)
-}
-
 // Sign-in secrets in Windows Credential Manager (#44, secrets.rs): generic credentials named
 // `<service>/<account>`, for this Windows user, roaming with the profile as MDM's data folder
 // (%APPDATA%) does. Credential Manager (Control Panel → Credential Manager → Windows

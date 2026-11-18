@@ -5017,6 +5017,7 @@ dependencies = [
 name = "mdm-core"
 version = "0.5.2"
 dependencies = [
+ "base64 0.23.1",
  "brotli",
  "brotli-decompressor",
  "chrono",
@@ -5024,8 +5025,10 @@ dependencies = [
  "dirs 7.0.0",
  "mdm-debrid",
  "mdm-engine",
+ "mdm-extract",
  "mdm-ipc",
  "mdm-platform",
+ "mdm-remote",
  "mdm-tools",
  "mdm-torrent",
  "regex",
@@ -5034,6 +5037,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
  "url",
 ]

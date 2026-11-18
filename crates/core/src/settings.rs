@@ -96,7 +96,7 @@ pub struct Settings {
     /// and the node last shown.
     pub show_categories: bool,
     pub branches: [bool; 4],
-    pub view: Option<crate::app::View>,
+    pub view: Option<crate::ui::View>,
     /// View → Dark Mode support (IDM 6.37): follow Windows' dark app mode; off = always light.
     pub dark_mode_support: bool,
     /// View → Always dark (#60): dark whatever the system says (a desktop that reports no
@@ -107,7 +107,7 @@ pub struct Settings {
     pub theme: String,
     /// View → Draw with (#89): OpenGL or Direct3D (Windows only), used from the next start.
     /// None: MDM's default (`renderer::DEFAULT`), which may change.
-    pub renderer: Option<crate::renderer::Api>,
+    pub renderer: Option<crate::ui::RendererApi>,
     /// View → Interface size (#262), percent: 100, 125, 150, 175 or 200 (crate::scale). Every
     /// window drawn that much larger than the display's own scale makes it.
     pub interface_size: u16,
@@ -474,8 +474,7 @@ impl Settings {
     /// (and the keychain is asked to take it). Serialized inside `secrets::prepared`, where these
     /// fields go as they are. Also called at start: secrets from before go to the keychain then.
     pub fn for_disk(&self) -> Settings {
-        let vault = crate::secrets::vault();
-        let mut pass = vault.pass();
+        let mut pass = crate::secrets::pass();
         let mut disk = self.clone();
         let mut keys = std::collections::HashSet::new();
         let mut kept = |key: String, label: &dyn Fn() -> String, secret: &str| {
@@ -486,7 +485,8 @@ impl Settings {
                 k = format!("{key}-{n}");
                 n += 1;
             }
-            pass.secret(&k, label, secret)
+            pass.as_mut()
+                .and_then(|p| p.secret(&k, label, secret))
                 .unwrap_or_else(|| sealed::seal(secret))
         };
         // Their names in the system's keychain (Credential Manager, the keyring).
@@ -523,7 +523,9 @@ impl Settings {
                 pw,
             );
         }
-        pass.finish();
+        if let Some(pass) = pass.as_mut() {
+            pass.finish();
+        }
         disk
     }
 
@@ -538,7 +540,7 @@ impl Settings {
 }
 
 /// FNV-1a: a stable hash (std's may change between builds), for keychain keys.
-pub(crate) fn fnv(s: &str) -> u64 {
+pub fn fnv(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.bytes() {
         h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
@@ -621,7 +623,7 @@ impl Settings {
             (false, _) => None,
         };
         let blocklist = (!self.torrent_blocklist.trim().is_empty())
-            .then(|| state_dir.join(crate::torrents::BLOCKLIST_FILE));
+            .then(|| state_dir.join(crate::torrent::BLOCKLIST_FILE));
         Some(mdm_torrent::Config {
             listen: self.torrent_incoming,
             upnp: self.torrent_upnp,
@@ -631,7 +633,7 @@ impl Settings {
             proxy,
             blocklist,
             // The chosen network adapter (#35, #143); the session takes it again when it starts.
-            bind: crate::torrents::route_bind(&own_route()).ok().flatten(),
+            bind: crate::torrent::route_bind(&own_route()).ok().flatten(),
             ..mdm_torrent::Config::new(state_dir)
         })
     }
@@ -800,8 +802,8 @@ impl Settings {
 
     /// Torrent settings' seeding limits: the share ratio and the seconds of sharing at which a
     /// finished torrent stops being shared (None: that limit is off).
-    pub fn sharing_limits(&self) -> crate::torrents::SharingLimits {
-        crate::torrents::SharingLimits {
+    pub fn sharing_limits(&self) -> crate::torrent::SharingLimits {
+        crate::torrent::SharingLimits {
             ratio: self
                 .torrent_stop_ratio_on
                 .then(|| f64::from(self.torrent_stop_ratio.max(1)) / 100.0),
@@ -1217,7 +1219,7 @@ pub(crate) mod sealed {
     pub(crate) fn seal(pw: &str) -> String {
         #[cfg(windows)]
         if !pw.is_empty()
-            && let Some(sealed) = crate::win32::protect(pw)
+            && let Some(sealed) = mdm_platform::protect(pw)
         {
             use base64::Engine as _;
             return format!(
@@ -1245,7 +1247,7 @@ pub(crate) mod sealed {
             return stored.to_owned();
         }
         if stored.starts_with(REF) {
-            return crate::secrets::vault().open(stored);
+            return crate::secrets::open(stored).unwrap_or_default();
         }
         if let Some(plain) = escaped(stored) {
             return plain.to_owned();
@@ -1256,7 +1258,7 @@ pub(crate) mod sealed {
             return base64::engine::general_purpose::STANDARD
                 .decode(b64)
                 .ok()
-                .and_then(|b| crate::win32::unprotect(&b))
+                .and_then(|b| mdm_platform::unprotect(&b))
                 .unwrap_or_default();
         }
         stored.to_owned()
