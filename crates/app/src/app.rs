@@ -4342,7 +4342,7 @@ impl App {
     /// A paired device's command (the remote control, #141) is answered while Options → Remote
     /// is on, whatever the automation API's switch: it may list, add and act, nothing else.
     fn answer(&mut self, cmd: &ipc::Command) -> String {
-        use ipc::api::{ApiAnswer, DownloadInfo, ErrorAnswer, ListAnswer, line};
+        use ipc::api::{ApiAnswer, ErrorAnswer, line};
         if cmd.pair && !cmd.remote {
             return self.pair_answer();
         }
@@ -4393,67 +4393,8 @@ impl App {
         }
         match cmd.query.as_deref() {
             Some("list") => {
-                let downloads = self
-                    .core
-                    .items
-                    .iter()
-                    .map(|i| DownloadInfo {
-                        id: i.id,
-                        file: i.file_name.clone(),
-                        // A paired device sees no folder of the computer's, nor a password in
-                        // an address.
-                        url: if cmd.remote {
-                            let mut u = i.url.clone();
-                            let _ = u.set_password(None);
-                            u.to_string()
-                        } else {
-                            i.url.to_string()
-                        },
-                        path: if cmd.remote {
-                            String::new()
-                        } else {
-                            i.dest.to_string_lossy().into_owned()
-                        },
-                        status: format!("{:?}", i.status),
-                        size: i.size,
-                        downloaded: i.downloaded,
-                        speed: if i.live.is_some() { i.rate() as u64 } else { 0 },
-                        added: i.added.clone(),
-                        category: i.category.key().into_owned(),
-                        error: i.error.clone().filter(|_| i.status == Status::Error),
-                    })
-                    .collect();
-                let speed: f64 = self
-                    .core
-                    .items
-                    .iter()
-                    .filter(|i| i.live.is_some())
-                    .map(|i| i.rate())
-                    .sum();
-                let queues = self
-                    .core
-                    .queues
-                    .iter()
-                    .map(|q| ipc::api::QueueInfo {
-                        name: q.name.clone(),
-                        running: q.running,
-                        ids: q.items.clone(),
-                    })
-                    .collect();
-                let categories = Category::all()
-                    .into_iter()
-                    .map(|c| ipc::api::CategoryInfo {
-                        key: c.key().into_owned(),
-                        name: c.label().into_owned(),
-                    })
-                    .collect();
-                line(&ListAnswer {
-                    downloads,
-                    speed: speed as u64,
-                    queues,
-                    categories,
-                    free: self.free_space(),
-                })
+                let free = self.free_space();
+                self.core.list_answer(cmd.remote, free)
             }
             other => line(&ErrorAnswer {
                 error: format!("unknown query {other:?}"),
@@ -4686,48 +4627,12 @@ impl App {
         action: &str,
         ids: &[u64],
     ) -> Result<ipc::api::ActAnswer, ipc::api::ErrorAnswer> {
-        if !matches!(action, "pause" | "start" | "remove" | "delete") {
-            return Err(ipc::api::ErrorAnswer {
-                error: format!("unknown action {action:?}"),
-                code: None,
-            });
-        }
-        let mut answer = ipc::api::ActAnswer::default();
-        for &id in ids {
-            let Some(item) = self.item(id) else {
-                answer.skipped.push(ipc::api::Skipped {
-                    id,
-                    why: "no such download".into(),
-                });
-                continue;
-            };
-            let running = item.live.is_some();
-            // As Resume: a finished gallery may start again (#58).
-            let startable = running || item.can_start();
-            let why = match action {
-                "pause" if !running => Some("not running"),
-                "pause" => {
-                    self.stop_by_hand(id);
-                    None
-                }
-                "start" if running => Some("already running"),
-                "start" if !startable => Some("complete"),
-                "start" => {
-                    self.start(id, false);
-                    None
-                }
-                _ if running => Some("running: pause it first"),
-                _ => {
-                    self.remove_download(id, action == "delete");
-                    None
-                }
-            };
-            match why {
-                Some(why) => answer.skipped.push(ipc::api::Skipped {
-                    id,
-                    why: why.into(),
-                }),
-                None => answer.done.push(id),
+        use mdm_core::session::ActEffect;
+        let (answer, effects) = self.core.act(action, ids)?;
+        for effect in effects {
+            match effect {
+                ActEffect::Start(id) => self.start(id, false),
+                ActEffect::Remove { id, files } => self.remove_download(id, files),
             }
         }
         Ok(answer)
@@ -4822,21 +4727,14 @@ impl App {
     }
 
     fn start_queue(&mut self, q: usize) {
-        if !self.core.queues[q].running {
+        if self.core.start_queue(q) {
             self.sound(2);
-        }
-        self.core.queues[q].running = true;
-        for id in &self.core.queues[q].items {
-            self.core.stopped_by_hand.remove(id);
         }
         self.tick_queues();
     }
 
     fn stop_queue(&mut self, q: usize) {
-        self.core.queues[q].running = false;
-        for id in self.core.queues[q].items.clone() {
-            self.stop(id);
-        }
+        self.core.stop_queue(q);
     }
 
     /// How a queue sees one of its downloads.
