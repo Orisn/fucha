@@ -1329,7 +1329,7 @@
 	gallery-dl can download this gallery's files.	gallery-dl can download this gallery's files.
 #. text in gallerydlg.rs
 	gallery-dl can't read this address. Add it as a file instead (Add URL).	gallery-dl can't read this address. Add it as a file instead (Add URL).
-#. message or event log entry in the main window
+#. text in session.rs
 #. a gallery download's error: the helper program it needs is missing
 	gallery-dl is not installed (Add URL with a gallery's address installs it)	gallery-dl is not installed (Add URL with a gallery's address installs it)
 #. text in countries.rs
@@ -2583,7 +2583,7 @@
 #. text in a download's progress window
 #. label: whether the server lets a stopped download continue (Yes / No)
 	Resume capability	Resume capability
-#. message or event log entry in the main window; text in session.rs
+#. text in session.rs
 #. event log entry, past tense: the download resumed (just now)
 	Resumed	Resumed
 #. button in the Help menu's windows (About, updates, shortcuts, Tell a friend)
@@ -2951,10 +2951,10 @@
 #. message or event log entry in the main window
 #. {queue} = a queue name such as "Main queue" (keep the braces as they are)
 	Start {queue}	Start {queue}
-#. message or event log entry in the main window; text in session.rs
+#. text in session.rs
 #. event log entry, past tense: the download started (just now)
 	Started	Started
-#. message or event log entry in the main window
+#. text in session.rs
 #. a gallery download's log: {version} = gallery-dl's version
 #. {version} = a version number (keep the braces as they are)
 	Started with gallery-dl {version}	Started with gallery-dl {version}
@@ -2964,7 +2964,7 @@
 #. text in the Options window
 #. tooltip of "Launch Mister Download Manager on startup": started with the computer, MDM's window stays hidden, its icon in the notification area (system tray)
 	Started with the computer, it waits in the notification area	Started with the computer, it waits in the notification area
-#. message or event log entry in the main window
+#. text in session.rs
 #. {version} = a version number; {format} = a video format code (keep the braces as they are)
 	Started with yt-dlp {version} ({format})	Started with yt-dlp {version} ({format})
 #. text in helpers.rs
@@ -3006,10 +3006,10 @@
 #. a download's status (state it is in, not a command)
 #. a download's status (state it is in, not a command): stopped by the user
 	Stopped	Stopped
-#. message or event log entry in the main window
+#. text in session.rs
 #. event log entry: the download stopped to start again through the network adapter as it is now (a VPN reconnected, another adapter chosen)
 	Stopped: the network adapter changed; starting again	Stopped: the network adapter changed; starting again
-#. message or event log entry in the main window
+#. text in session.rs
 #. event log entry: the download stopped because the chosen network adapter (a VPN's, usually) went away; {adapter} its name
 	Stopped: {adapter} is not connected; it goes on when it is back	Stopped: {adapter} is not connected; it goes on when it is back
 #. text in a download's progress window
@@ -3880,7 +3880,7 @@
 #. text in the Download video window
 #. the Download video window: the browser chosen in Options has no cookies on this computer (not installed, or another profile); {browser} = its name
 	yt-dlp found no cookies of {browser} on this computer. Check the browser and its profile in Options → Sites Logins.	yt-dlp found no cookies of {browser} on this computer. Check the browser and its profile in Options → Sites Logins.
-#. message or event log entry in the main window
+#. text in session.rs
 	yt-dlp is not installed (Tasks → Download video from a page installs it)	yt-dlp is not installed (Tasks → Download video from a page installs it)
 #. text in the Options window
 #. Options → Sites Logins → Cookies for video sites: the tooltip of its choices
