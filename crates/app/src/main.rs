@@ -50,7 +50,7 @@ mod scrollbar;
 mod secrets;
 mod selection;
 pub use mdm_core::settings;
-mod store;
+pub use mdm_core::store;
 mod theme;
 mod themefile;
 mod themeicons;

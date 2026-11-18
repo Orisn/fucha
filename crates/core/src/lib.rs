@@ -6,6 +6,7 @@
 pub mod countries;
 pub mod errors;
 pub mod i18n;
+pub mod layout;
 pub mod model;
 pub mod pacfetch;
 pub mod paths;
@@ -15,6 +16,7 @@ pub mod regional;
 pub mod rss;
 pub mod secrets;
 pub mod settings;
+pub mod store;
 pub mod torrent;
 pub mod torrent_spec;
 pub mod ui;

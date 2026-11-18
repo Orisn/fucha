@@ -47,7 +47,9 @@ themed! {
 /// "Added" (2026-10-30: when the download was added; sorts in order of addition), "Source"
 /// (D-014: a Web or Torrent chip, first by default), and a torrent's "Peers" and "Share ratio"
 /// (#357: how many peers it has connected and what it has given back).
-pub const COLS: usize = 12;
+pub use mdm_core::layout::{
+    ADDED, COLS, DEFAULT_ORDER, DEFAULT_WIDTHS, Layout, PEERS, RATIO, SOURCE,
+};
 pub const TITLES: [&str; COLS] = [
     "File Name",
     // i18n: column title: one letter for Queue (the column is narrow)
@@ -70,23 +72,6 @@ pub const TITLES: [&str; COLS] = [
     // i18n: column title: what a torrent has sent to peers against what it took
     "Share ratio",
 ];
-/// The "Added" column's data slot.
-pub const ADDED: usize = 8;
-/// The "Source" column's data slot: its cell is "Web" or "Torrent", painted as a chip.
-pub const SOURCE: usize = 9;
-/// The "Peers" column's data slot (a torrent's connected peers; blank for anything else).
-pub const PEERS: usize = 10;
-/// The "Share ratio" column's data slot (a torrent's sent over taken; blank otherwise).
-pub const RATIO: usize = 11;
-
-/// IDM's default column widths (and ours for Added, room for a 12-hour clock's
-/// `Oct 28 9:05:01 AM 2026`, Source, Peers and Share ratio).
-pub const DEFAULT_WIDTHS: [f32; COLS] = [
-    150.0, 20.0, 75.0, 65.0, 75.0, 95.0, 65.0, 200.0, 145.0, 62.0, 64.0, 92.0,
-];
-/// Default display order: Source first, then IDM's, a torrent's two columns after its rate, and
-/// Added after Last Try Date.
-const DEFAULT_ORDER: [usize; COLS] = [SOURCE, 0, 1, 2, 3, 4, 5, PEERS, RATIO, 6, ADDED, 7];
 
 const MIN_WIDTH: f32 = 16.0;
 /// How far from a separator a press grabs it for resizing.
@@ -211,14 +196,7 @@ impl Default for ListState {
 }
 
 /// The part of the column state that is saved with the download list.
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Layout {
-    pub order: Vec<usize>,
-    /// Lists (not fixed arrays), so layouts saved before a column was added still load.
-    pub widths: Vec<f32>,
-    pub visible: Vec<bool>,
-    pub sort: Option<(usize, bool)>,
-}
+// Layout lives in mdm-core (`crate::layout`); the list re-exports it above.
 
 impl ListState {
     /// Does the list have the keys? (A click elsewhere, or Tab to the Categories tree,

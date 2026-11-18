@@ -14,7 +14,7 @@ use std::time::Duration;
 use mdm_engine::state::{ResumeState, state_path};
 use serde::{Deserialize, Serialize};
 
-use crate::list::Layout;
+use crate::layout::Layout;
 use crate::model::{Item, Status};
 use crate::queue::Queue;
 use crate::settings::Settings;
@@ -296,7 +296,7 @@ fn write(p: &Path, json: &[u8]) -> std::io::Result<()> {
     // The list holds the saved logins: its owner's only (the folder too).
     mdm_ipc::private_write(p, json)?;
     // On the disk now: keychain entries it no longer names can go.
-    crate::secrets::vault().after_write();
+    crate::secrets::after_write();
     Ok(())
 }
 
@@ -314,6 +314,12 @@ struct SaverState {
     writing: bool,
     /// The last write's outcome, not yet taken.
     outcome: Option<Result<(), String>>,
+}
+
+impl Default for Saver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Saver {
@@ -405,7 +411,7 @@ mod tests {
     fn the_saver_writes_the_newest_list_off_the_calling_thread() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("downloads.json");
-        let layout = crate::list::ListState::default().layout();
+        let layout = Layout::default();
         let saver = Saver::new();
         for id in [3, 5] {
             let json = encode(&p, id, &[], &layout, &Settings::default(), &[]).unwrap();
@@ -420,7 +426,7 @@ mod tests {
     fn a_damaged_list_falls_back_to_the_previous_generation() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("downloads.json");
-        let layout = crate::list::ListState::default().layout();
+        let layout = Layout::default();
         save_to(&p, 7, &[], &layout, &Settings::default(), &[]).unwrap();
         save_to(&p, 9, &[], &layout, &Settings::default(), &[]).unwrap();
         assert_eq!(load_from(&p, empty()).next_id, 9);
@@ -444,7 +450,7 @@ mod tests {
     fn a_list_of_thousands_saves_and_loads_quickly() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("downloads.json");
-        let layout = crate::list::ListState::default().layout();
+        let layout = Layout::default();
         let items: Vec<Item> = (1..=6000u64)
             .map(|id| {
                 let url =
@@ -486,7 +492,7 @@ mod tests {
     }
 
     fn save_n(p: &Path, n: u64) {
-        let layout = crate::list::ListState::default().layout();
+        let layout = Layout::default();
         save_to(p, n, &[], &layout, &Settings::default(), &[]).unwrap();
     }
 
@@ -588,7 +594,7 @@ mod tests {
         // Written as version 2, a 1 chosen in the Scheduler stays.
         let mut q = Queue::new("Main download queue", false);
         q.files_at_once = 1;
-        let layout = crate::list::ListState::default().layout();
+        let layout = Layout::default();
         save_to(&p, 3, &[], &layout, &Settings::default(), &[q]).unwrap();
         assert_eq!(load_from(&p, empty()).queues[0].files_at_once, 1);
     }
@@ -600,7 +606,7 @@ mod tests {
         let p = dir.path().join("downloads.json");
         std::fs::create_dir(&p).unwrap();
         let _ = load_from(&p, empty());
-        let layout = crate::list::ListState::default().layout();
+        let layout = Layout::default();
         assert!(save_to(&p, 5, &[], &layout, &Settings::default(), &[]).is_err());
         assert!(p.is_dir());
     }
@@ -609,7 +615,7 @@ mod tests {
     fn a_damaged_file_never_replaces_a_good_backup() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("downloads.json");
-        let layout = crate::list::ListState::default().layout();
+        let layout = Layout::default();
         save_to(&p, 3, &[], &layout, &Settings::default(), &[]).unwrap();
         save_to(&p, 4, &[], &layout, &Settings::default(), &[]).unwrap();
         std::fs::write(&p, b"garbage").unwrap();
