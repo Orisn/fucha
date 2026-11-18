@@ -24,6 +24,7 @@ use crate::queue::{self, Member, Queue};
 use crate::settings::Settings;
 use crate::store;
 use crate::winui;
+use mdm_core::session::Core;
 use mdm_ipc as ipc;
 
 pub use mdm_core::ui::View;
@@ -403,9 +404,9 @@ enum Branch {
 }
 
 pub struct App {
-    rt: tokio::runtime::Handle,
-    items: Vec<Item>,
-    next_id: u64,
+    /// The session's state: the list, queues, settings and persistence. The fields below the
+    /// window's own are reached through `Deref` (`self.core.items`, `self.core.settings`…).
+    core: Core,
     /// The list's selection (several downloads, Ctrl / Shift).
     selection: crate::selection::Selection,
     view: View,
@@ -463,7 +464,6 @@ pub struct App {
     update_checked_this_run: Option<i64>,
     progress: Vec<Progress>,
     complete: Vec<Complete>,
-    settings: Settings,
     speed_settings: Option<dialogs::SpeedSettings>,
     scheduler: Option<crate::scheduler::Scheduler>,
     options: Option<crate::options::OptionsDialog>,
@@ -563,12 +563,6 @@ pub struct App {
     turn_off: Option<dialogs::TurnOffCountdown>,
     /// A finished queue asked to exit.
     exit_requested: bool,
-    /// The global speed cap shared by every download (Speed Limiter settings).
-    global: std::sync::Arc<mdm_engine::limiter::Limiter>,
-    /// Connection caps learned per host, shared by every download.
-    host_limits: std::sync::Arc<mdm_engine::hosts::HostLimits>,
-    /// Scheduler → Download limits: traffic in the window, and what the limit holds back.
-    quota: crate::quota::Quota,
     /// "Show warning before stopping downloads": the notice, while open.
     limit_notice: Option<dialogs::LimitNotice>,
     /// The notification-area icon (created on the first frame), the window hidden in it, and
@@ -607,13 +601,6 @@ pub struct App {
     duplicates_waiting: std::collections::VecDeque<(u64, Pending, dialogs::Duplicate)>,
     /// The next duplicate check is passed (the user chose to add it anyway).
     duplicate_cleared: bool,
-    downloads: PathBuf,
-    dirty: bool,
-    /// `secrets::Vault::confirmed` when last seen.
-    secrets_confirmed: u64,
-    last_save: Instant,
-    /// Writes the list off the window's thread.
-    saver: store::Saver,
     /// When the light/dark mode was last checked against Windows' app mode.
     theme_checked: Option<Instant>,
     /// The zoom (View → Interface size, #262) the windows were last drawn at: a change is saved,
@@ -649,17 +636,6 @@ pub struct App {
     popup_serial: u64,
     /// The column layout last seen, to notice changes that need saving.
     last_layout: Option<list::Layout>,
-    /// Main download queue (0), synchronization queue (1).
-    queues: Vec<Queue>,
-    /// Failure time and count per download, for queue retries.
-    failures: HashMap<u64, (Instant, u32)>,
-    /// Stopped by hand while they could have run: a running queue leaves them alone until
-    /// they are started again or the queue is started anew (#341).
-    stopped_by_hand: std::collections::HashSet<u64>,
-    /// Seconds since local midnight at the last scheduler tick.
-    clock: u32,
-    /// Scheduler → "Wake the computer to run this queue": the wake set with the system (#142).
-    wake: crate::wake::Waker,
     /// Commands from ipc.rs (command line, second launch, browser).
     commands: std::sync::mpsc::Receiver<ipc::Incoming>,
 }
@@ -904,7 +880,7 @@ impl App {
     pub fn headless(mut self, downloads: Option<PathBuf>) -> Self {
         self.headless = true;
         if let Some(d) = downloads {
-            self.downloads = d;
+            self.core.downloads = d;
         }
         self
     }
@@ -1030,9 +1006,25 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
         App {
-            rt,
-            items,
-            next_id,
+            core: Core {
+                rt,
+                items,
+                next_id,
+                queues,
+                settings,
+                downloads,
+                dirty: false,
+                secrets_confirmed: 0,
+                last_save: Instant::now(),
+                saver: store::Saver::new(),
+                clock: seconds_now(),
+                wake: Default::default(),
+                global: std::sync::Arc::new(mdm_engine::limiter::Limiter::new(None)),
+                host_limits: Default::default(),
+                quota: Default::default(),
+                failures: HashMap::new(),
+                stopped_by_hand: Default::default(),
+            },
             selection: Default::default(),
             view,
             show_categories,
@@ -1067,7 +1059,6 @@ impl App {
             kept_answers: Default::default(),
             progress: Vec::new(),
             complete: Vec::new(),
-            settings,
             speed_settings: None,
             scheduler: None,
             options: None,
@@ -1123,9 +1114,6 @@ impl App {
             moving: Vec::new(),
             turn_off: None,
             exit_requested: false,
-            global: std::sync::Arc::new(mdm_engine::limiter::Limiter::new(None)),
-            host_limits: Default::default(),
-            quota: Default::default(),
             limit_notice: None,
             clip_seen: None,
             clip_checked: None,
@@ -1148,11 +1136,6 @@ impl App {
             duplicate: None,
             duplicates_waiting: Default::default(),
             duplicate_cleared: false,
-            downloads,
-            dirty: false,
-            secrets_confirmed: 0,
-            last_save: Instant::now(),
-            saver: store::Saver::new(),
             theme_checked: None,
             zoom,
             fitted: false,
@@ -1172,24 +1155,19 @@ impl App {
             popup: None,
             popup_serial: 0,
             last_layout: None,
-            queues,
-            failures: HashMap::new(),
-            stopped_by_hand: Default::default(),
-            clock: seconds_now(),
-            wake: Default::default(),
             commands,
         }
     }
 
     fn item(&mut self, id: u64) -> Option<&mut Item> {
-        self.items.iter_mut().find(|i| i.id == id)
+        self.core.item(id)
     }
 
     /// The one download single-download commands act on (Properties, Open…).
     fn selected_item(&self) -> Option<&Item> {
         self.selection
             .one()
-            .and_then(|id| self.items.iter().find(|i| i.id == id))
+            .and_then(|id| self.core.items.iter().find(|i| i.id == id))
     }
 
     /// The downloads a command acts on: those selected, in list order; a right-clicked one
@@ -1205,7 +1183,7 @@ impl App {
     fn chosen(&self, target: Option<u64>) -> Vec<&Item> {
         self.targets(target)
             .into_iter()
-            .filter_map(|id| self.items.iter().find(|i| i.id == id))
+            .filter_map(|id| self.core.items.iter().find(|i| i.id == id))
             .collect()
     }
 
@@ -1224,7 +1202,7 @@ impl App {
                 "Clear all filters",
                 Cmd::ClearFilters,
             )
-        } else if !self.items.is_empty() {
+        } else if !self.core.items.is_empty() {
             (
                 // i18n: title in the empty download list (this category or queue has no downloads)
                 "No downloads here",
@@ -1305,7 +1283,12 @@ impl App {
 
     /// "2 downloading, 1.25 MB/sec" while downloads run (the status strip, the tray's tip).
     fn activity(&self) -> Option<String> {
-        let running: Vec<&Item> = self.items.iter().filter(|i| i.live.is_some()).collect();
+        let running: Vec<&Item> = self
+            .core
+            .items
+            .iter()
+            .filter(|i| i.live.is_some())
+            .collect();
         if running.is_empty() {
             return None;
         }
@@ -1335,6 +1318,7 @@ impl App {
     /// The rows the list draws ([`Self::shown_ids`]) with their cells.
     fn list_rows(&self) -> (Vec<u64>, Vec<list::Row>) {
         let queued: std::collections::HashSet<u64> = self
+            .core
             .queues
             .iter()
             .flat_map(|q| q.items.iter().copied())
@@ -1413,11 +1397,16 @@ impl App {
     /// [`Self::view_ids`]'s downloads themselves (each sort key worked out once, not at
     /// every comparison).
     fn view_items(&self) -> Vec<&Item> {
-        let shown = self.items.iter().filter(|i| self.in_view(self.view, i));
+        let shown = self
+            .core
+            .items
+            .iter()
+            .filter(|i| self.in_view(self.view, i));
         let Some((col, asc)) = self.list.sort else {
             return shown.collect();
         };
         let queued: std::collections::HashSet<u64> = self
+            .core
             .queues
             .iter()
             .flat_map(|q| q.items.iter().copied())
@@ -1440,7 +1429,11 @@ impl App {
             View::Cat(c) => i.category == c,
             View::Unfinished(c) => i.status != Status::Complete && in_cat(c),
             View::Finished(c) => i.status == Status::Complete && in_cat(c),
-            View::Queue(q) => self.queues.get(q).is_some_and(|q| q.items.contains(&i.id)),
+            View::Queue(q) => self
+                .core
+                .queues
+                .get(q)
+                .is_some_and(|q| q.items.contains(&i.id)),
         }
     }
 
@@ -1450,9 +1443,10 @@ impl App {
         // Only a folder other than the category's becomes its new one (an unchanged folder
         // stays "the default", following Downloads).
         if let Some((cat, dir)) = fi.remembered()
-            && std::path::Path::new(&dir) != self.settings.category_dir(cat, &self.downloads)
+            && std::path::Path::new(&dir)
+                != self.core.settings.category_dir(cat, &self.core.downloads)
         {
-            self.settings.set_category_dir(cat, Some(dir));
+            self.core.settings.set_category_dir(cat, Some(dir));
         }
         let id = self.push_item(
             fi.url.clone(),
@@ -1479,16 +1473,16 @@ impl App {
             self.start(id, true);
         } else {
             // "Download Later": the main download queue (IDM's default), or the one picked.
-            self.queue_later(vec![id], self.settings.queue_panel_later);
+            self.queue_later(vec![id], self.core.settings.queue_panel_later);
         }
-        self.dirty = true;
+        self.core.dirty = true;
     }
 
     /// Options → Downloads → "Start downloading immediately while displaying Download File
     /// Info": once the address answered (name and size known) and its folder exists, the
     /// download starts behind the dialog; the dialog's answer then keeps, moves or drops it.
     fn start_early(&mut self, fi: &mut FileInfo) {
-        if !self.settings.start_immediately || fi.early.is_some() || !fi.probed() {
+        if !self.core.settings.start_immediately || fi.early.is_some() || !fi.probed() {
             return;
         }
         let dest = fi.dest();
@@ -1520,9 +1514,10 @@ impl App {
     /// Download File Info closed with Start / Later on a download that started early.
     fn adopt_early(&mut self, fi: &FileInfo, id: u64, start: Start) {
         if let Some((cat, dir)) = fi.remembered()
-            && std::path::Path::new(&dir) != self.settings.category_dir(cat, &self.downloads)
+            && std::path::Path::new(&dir)
+                != self.core.settings.category_dir(cat, &self.core.downloads)
         {
-            self.settings.set_category_dir(cat, Some(dir));
+            self.core.settings.set_category_dir(cat, Some(dir));
         }
         let dest = fi.dest();
         let now = matches!(start, Start::Now);
@@ -1538,6 +1533,7 @@ impl App {
             self.after_stop.push((id, Some((dest, now))));
         } else if now {
             let (live, complete) = self
+                .core
                 .items
                 .iter()
                 .find(|i| i.id == id)
@@ -1546,8 +1542,8 @@ impl App {
                 });
             if complete {
                 // It finished behind the dialog: its box now.
-                if self.settings.show_complete
-                    && let Some(i) = self.items.iter().find(|i| i.id == id)
+                if self.core.settings.show_complete
+                    && let Some(i) = self.core.items.iter().find(|i| i.id == id)
                 {
                     self.complete.push(Complete {
                         id,
@@ -1563,16 +1559,16 @@ impl App {
                 self.start(id, true);
             } else if !self.progress.iter().any(|p| p.id == id) {
                 self.progress
-                    .push(Progress::new(id, self.settings.show_complete));
+                    .push(Progress::new(id, self.core.settings.show_complete));
             }
         } else {
             // Later: paused, its data kept for the queue to resume.
             self.stop(id);
         }
         if !now {
-            self.queue_later(vec![id], self.settings.queue_panel_later);
+            self.queue_later(vec![id], self.core.settings.queue_panel_later);
         }
-        self.dirty = true;
+        self.core.dirty = true;
     }
 
     /// Carry out `after_stop` for downloads that have stopped.
@@ -1593,7 +1589,7 @@ impl App {
                     // Cancelled: a file that finished meanwhile goes too, with its windows. On
                     // another thread: a slow or stuck disk took the window with it (#423).
                     let complete = item.status == Status::Complete;
-                    self.rt.spawn_blocking({
+                    self.core.rt.spawn_blocking({
                         let old = old.clone();
                         move || remove_files_of(&old, complete)
                     });
@@ -1608,7 +1604,8 @@ impl App {
                         remove_files_of(&old, complete);
                     } else {
                         let old = old.clone();
-                        self.rt
+                        self.core
+                            .rt
                             .spawn_blocking(move || remove_files_of(&old, complete));
                     }
                     let item = self.item(id).expect("the download just found");
@@ -1623,7 +1620,7 @@ impl App {
                     }
                 }
             }
-            self.dirty = true;
+            self.core.dirty = true;
         }
     }
 
@@ -1634,12 +1631,12 @@ impl App {
             return;
         }
         if ask && self.queue_pick.is_none() {
-            let names = self.queues.iter().map(|q| q.name.clone()).collect();
+            let names = self.core.queues.iter().map(|q| q.name.clone()).collect();
             self.queue_pick = Some((ids, dialogs::QueuePick::new(names)));
         } else {
-            self.queues[0].items.extend(ids);
+            self.core.queues[0].items.extend(ids);
         }
-        self.dirty = true;
+        self.core.dirty = true;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1654,8 +1651,8 @@ impl App {
         context: ipc::Command,
         source: &str,
     ) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.core.next_id;
+        self.core.next_id += 1;
         let mut item = Item::new(id, url, dest, category);
         item.note(crate::i18n::fmt(
             crate::i18n::t("Added {source}"),
@@ -1667,8 +1664,8 @@ impl App {
         // The browser had started it: the host is already sending the file (#44).
         item.direct = crate::debrid::browser_started(&context);
         item.context = context;
-        self.items.push(item);
-        self.dirty = true;
+        self.core.items.push(item);
+        self.core.dirty = true;
         id
     }
 
@@ -1697,11 +1694,17 @@ impl App {
     fn debrid_tick(&mut self) {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        for a in self.settings.debrid_accounts.iter().filter(|a| a.enabled) {
+        for a in self
+            .core
+            .settings
+            .debrid_accounts
+            .iter()
+            .filter(|a| a.enabled)
+        {
             (a.id, a.service, &a.secret).hash(&mut h);
         }
         format!("{:?}", crate::settings::own_net().proxy).hash(&mut h);
-        self.settings.dns().hash(&mut h);
+        self.core.settings.dns().hash(&mut h);
         self.route.hash(&mut h);
         let from = h.finish();
         if from == self.debrid_from {
@@ -1709,6 +1712,7 @@ impl App {
         }
         self.debrid_from = from;
         let accounts: Vec<mdm_debrid::Account> = self
+            .core
             .settings
             .debrid_accounts
             .iter()
@@ -1722,7 +1726,7 @@ impl App {
         self.debrid.set_accounts(accounts, http);
         if any {
             let debrid = self.debrid.clone();
-            self.rt.spawn(async move {
+            self.core.rt.spawn(async move {
                 if let Err(e) = debrid.refresh_hosts().await {
                     tracing::warn!("debrid host lists: {e:?}");
                 }
@@ -1732,11 +1736,11 @@ impl App {
 
     /// Which account downloads go through (#44), for the windows that show and change it.
     pub fn debrid_route(&self) -> crate::debrid::Route {
-        crate::debrid::Route::new(&self.debrid, &self.settings)
+        crate::debrid::Route::new(&self.debrid, &self.core.settings)
     }
 
     fn network_adapter_tick(&mut self, ctx: &egui::Context) {
-        let route = self.netwatch.route(&self.settings.net_adapter, ctx);
+        let route = self.netwatch.route(&self.core.settings.net_adapter, ctx);
         crate::settings::share_route(route.clone());
         if route != self.route {
             let before = std::mem::replace(&mut self.route, route.clone());
@@ -1750,10 +1754,15 @@ impl App {
             .adapter_paused
             .iter()
             .copied()
-            .filter(|id| self.items.iter().any(|i| i.id == *id && i.live.is_none()))
+            .filter(|id| {
+                self.core
+                    .items
+                    .iter()
+                    .any(|i| i.id == *id && i.live.is_none())
+            })
             .collect();
         self.adapter_paused
-            .retain(|id| self.items.iter().any(|i| i.id == *id) && !ready.contains(id));
+            .retain(|id| self.core.items.iter().any(|i| i.id == *id) && !ready.contains(id));
         for id in ready {
             self.start(id, false);
         }
@@ -1770,7 +1779,7 @@ impl App {
             _ => crate::i18n::t("Stopped: the network adapter changed; starting again").to_owned(),
         };
         let mut stopped = Vec::new();
-        for i in &mut self.items {
+        for i in &mut self.core.items {
             if let Some(l) = &i.live {
                 l.dl.cancel();
                 i.note(note.clone());
@@ -1784,9 +1793,9 @@ impl App {
         }
         // The torrent session's sockets were bound as things were.
         if !before.is_any() || !self.route.is_any() {
-            self.torrent_host.stop_now(&self.rt);
+            self.torrent_host.stop_now(&self.core.rt);
         }
-        self.dirty = true;
+        self.core.dirty = true;
     }
 
     /// Every 2 s (#40): Torrent settings for the next torrent session, and the running one stopped
@@ -1805,16 +1814,21 @@ impl App {
         let Some(t) = self.torrent_host.get() else {
             // No session: no check is running, whatever the last numbers said.
             self.torrent_resync.clear();
-            for i in self.items.iter_mut() {
+            for i in self.core.items.iter_mut() {
                 i.torrent_check = None;
             }
-            crate::torrents::clear_peers(self.items.iter_mut().filter_map(|i| i.torrent.as_mut()));
+            crate::torrents::clear_peers(
+                self.core
+                    .items
+                    .iter_mut()
+                    .filter_map(|i| i.torrent.as_mut()),
+            );
             return;
         };
-        let limits = self.settings.sharing_limits();
+        let limits = self.core.settings.sharing_limits();
         let mut changed = false;
         let mut hashes = std::collections::HashSet::new();
-        for i in self.items.iter_mut() {
+        for i in self.core.items.iter_mut() {
             let Some(spec) = i.torrent.as_mut() else {
                 continue;
             };
@@ -1848,14 +1862,14 @@ impl App {
                 && let Some(why) = crate::torrents::sharing_limit_reached(spec, st.done, limits)
             {
                 let (t2, hash) = (t.clone(), spec.hash.clone());
-                self.rt.spawn(async move {
+                self.core.rt.spawn(async move {
                     let _ = t2.remove(&hash, false).await;
                 });
                 stopped = Some(why);
                 changed = true;
             }
             let (hash, up) = (spec.hash.clone(), spec.upload_limit);
-            let stop_after_recheck = !self.settings.torrent_keep_sharing
+            let stop_after_recheck = !self.core.settings.torrent_keep_sharing
                 || crate::torrents::sharing_limit_reached(spec, st.done, limits).is_some();
             if i.live.is_none() {
                 let _ = t.set_torrent_limits(&hash, None, up);
@@ -1889,45 +1903,46 @@ impl App {
                         i.status = Status::Complete;
                         if report && i.live.is_none() && stop_after_recheck {
                             let t2 = t.clone();
-                            self.rt.spawn(async move {
+                            self.core.rt.spawn(async move {
                                 let _ = t2.remove(&hash, false).await;
                             });
                         }
                     } else if i.status == Status::Complete {
                         i.status = Status::Stopped;
                         let t2 = t.clone();
-                        self.rt.spawn(async move {
+                        self.core.rt.spawn(async move {
                             let _ = t2.pause(&hash).await;
                         });
                     }
                 }
-                self.dirty = true;
+                self.core.dirty = true;
             }
         }
         self.accountant.keep(&hashes);
         if changed && self.account_saved.elapsed() >= Duration::from_secs(10) {
             self.account_saved = now;
-            self.dirty = true;
+            self.core.dirty = true;
         }
     }
 
     fn torrent_tick(&mut self) {
-        let cfg = crate::torrents::state_dir().and_then(|d| self.settings.torrent_config(d));
+        let cfg = crate::torrents::state_dir().and_then(|d| self.core.settings.torrent_config(d));
         self.torrent_host.set_config(cfg);
         self.torrent_host
-            .set_upload(self.settings.torrent_upload_limit());
+            .set_upload(self.core.settings.torrent_upload_limit());
         self.torrent_outcomes();
         self.torrent_accounts();
         self.rss_tick();
-        if !self.settings.torrent_blocklist.trim().is_empty() {
+        if !self.core.settings.torrent_blocklist.trim().is_empty() {
             crate::torrents::refresh_blocklist(
-                &self.rt,
-                &self.settings.torrent_blocklist,
+                &self.core.rt,
+                &self.core.settings.torrent_blocklist,
                 &self.blocklist_busy,
             );
         }
-        let sharing = self.settings.torrent_keep_sharing
+        let sharing = self.core.settings.torrent_keep_sharing
             && self
+                .core
                 .items
                 .iter()
                 .any(|i| i.torrent.is_some() && i.status == Status::Complete);
@@ -1935,7 +1950,7 @@ impl App {
         // or its result not read yet) needs the session too: stopped as idle after a minute,
         // the check died where it was and the list said "Checking 17%" for good.
         let checking = !self.torrent_resync.is_empty()
-            || self.items.iter().any(|i| {
+            || self.core.items.iter().any(|i| {
                 i.torrent_check.is_some()
                     || i.torrent
                         .as_ref()
@@ -1945,6 +1960,7 @@ impl App {
             || checking
             || self.torrent_dlg.is_some()
             || self
+                .core
                 .items
                 .iter()
                 .any(|i| i.torrent.is_some() && i.live.is_some());
@@ -1954,8 +1970,11 @@ impl App {
         }
         let since = *self.torrent_idle_since.get_or_insert_with(Instant::now);
         if since.elapsed() >= Duration::from_secs(60) {
-            self.torrent_host
-                .stop_if_idle(&self.rt, true, self.settings.torrent_stop_idle);
+            self.torrent_host.stop_if_idle(
+                &self.core.rt,
+                true,
+                self.core.settings.torrent_stop_idle,
+            );
         }
     }
 
@@ -1963,8 +1982,8 @@ impl App {
     /// command does. Unknown names do nothing.
     fn show_named(&mut self, name: &str, ctx: &egui::Context) {
         self.show_window(ctx);
-        let first = self.items.first().map(|i| i.id);
-        let last = self.items.last().map(|i| i.id);
+        let first = self.core.items.first().map(|i| i.id);
+        let last = self.core.items.last().map(|i| i.id);
         let (window, tab) = name.split_once(':').unwrap_or((name, ""));
         match window {
             "addurl" => self.run(Cmd::AddUrl, None, ctx),
@@ -2086,8 +2105,9 @@ impl App {
                 // In General's folder (a test's own, set in its data folder), not the system's
                 // Downloads, whose path names the user.
                 let dir = self
+                    .core
                     .settings
-                    .category_dir(Category::General, &self.downloads)
+                    .category_dir(Category::General, &self.core.downloads)
                     .join("Big Buck Bunny");
                 self.shown_existing = Some(crate::dialogs::ExistingFiles::new(&[
                     dir.join("big_buck_bunny_1080p.mkv"),
@@ -2112,8 +2132,9 @@ impl App {
             "checksum" if first.is_some() => self.run(Cmd::VerifyChecksum, first, ctx),
             "gallery" => {
                 let dir = self
+                    .core
                     .settings
-                    .category_dir(Category::General, &self.downloads);
+                    .category_dir(Category::General, &self.core.downloads);
                 self.gallery_dlg = Some(crate::gallerydlg::GalleryDialog::new(
                     dir,
                     "https://commons.wikimedia.org/wiki/Category:Sunsets",
@@ -2127,7 +2148,7 @@ impl App {
                     && !self.progress.iter().any(|p| p.id == id)
                 {
                     self.progress
-                        .push(Progress::new(id, self.settings.show_complete));
+                        .push(Progress::new(id, self.core.settings.show_complete));
                 }
                 // progress:peers and so on: a torrent's details tab (the docs' screenshots).
                 if let Some(id) = last
@@ -2180,6 +2201,7 @@ impl App {
             // A finished archive's right-click menu (Extract, #37), for screenshots.
             "context" => {
                 let archive = self
+                    .core
                     .items
                     .iter()
                     .rev()
@@ -2188,7 +2210,7 @@ impl App {
                             && crate::extractq::archive_name(&i.file_name)
                             && mdm_extract::volume_key(&i.file_name).is_none_or(|v| v.is_first())
                     })
-                    .or(self.items.last())
+                    .or(self.core.items.last())
                     .map(|i| i.id);
                 self.open_menu = None;
                 if let Some(id) = archive {
@@ -2275,20 +2297,23 @@ impl App {
         // page up at once.
         if let Some(page) = cmd.video_page.as_deref() {
             self.show_window(ctx);
-            let dir = self.settings.category_dir(Category::Video, &self.downloads);
-            crate::videodlg::refresh_ytdlp(&self.rt);
+            let dir = self
+                .core
+                .settings
+                .category_dir(Category::Video, &self.core.downloads);
+            crate::videodlg::refresh_ytdlp(&self.core.rt);
             let page = page.to_owned();
             self.video_dlg = Some(
                 crate::videodlg::VideoDialog::for_page(dir, &page, cmd)
-                    .with_subs(self.settings.video_subs.clone()),
+                    .with_subs(self.core.settings.video_subs.clone()),
             );
             return;
         }
         // Its menu: never on this site.
         if let Some(host) = cmd.panel_hide_site.as_deref() {
-            self.settings.video_panel_sites =
-                mdm_ipc::capture::add_site(&self.settings.video_panel_sites, host);
-            self.dirty = true;
+            self.core.settings.video_panel_sites =
+                mdm_ipc::capture::add_site(&self.core.settings.video_panel_sites, host);
+            self.core.dirty = true;
             return;
         }
         // The browser's right-click menu: a page's (or a selection's) links, to tick in Import.
@@ -2312,9 +2337,9 @@ impl App {
         }
         // The browser's toolbar button: this site's downloads stay with the browser.
         if let Some(host) = cmd.exclude_site.as_deref() {
-            self.settings.excluded_sites =
-                mdm_ipc::capture::add_site(&self.settings.excluded_sites, host);
-            self.dirty = true;
+            self.core.settings.excluded_sites =
+                mdm_ipc::capture::add_site(&self.core.settings.excluded_sites, host);
+            self.core.dirty = true;
             return;
         }
         if cmd.start_queue {
@@ -2368,7 +2393,7 @@ impl App {
             return;
         }
         // Options → Downloads → "Show start download dialog" off: start (or only queue) at once.
-        let skip_dialog = !self.settings.show_start_dialog;
+        let skip_dialog = !self.core.settings.show_start_dialog;
         if cmd.later || cmd.silent || skip_dialog {
             let guessed = cmd.name.is_none();
             let name = cmd
@@ -2385,15 +2410,15 @@ impl App {
             let queue = cmd
                 .queue
                 .as_deref()
-                .and_then(|n| self.queues.iter().position(|q| q.name == n))
+                .and_then(|n| self.core.queues.iter().position(|q| q.name == n))
                 .unwrap_or(0);
-            let dir = cmd
-                .dir
-                .clone()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| self.settings.category_dir(category, &self.downloads));
+            let dir = cmd.dir.clone().map(PathBuf::from).unwrap_or_else(|| {
+                self.core
+                    .settings
+                    .category_dir(category, &self.core.downloads)
+            });
             let dest = mdm_engine::naming::destination(&dir, &name);
-            let later = cmd.later || (skip_dialog && self.settings.only_add_to_queue);
+            let later = cmd.later || (skip_dialog && self.core.settings.only_add_to_queue);
             let source = if cmd.referer.is_some() || cmd.cookies.is_some() {
                 crate::i18n::mark("from the browser")
             } else {
@@ -2403,7 +2428,7 @@ impl App {
             let id = self.push_item(url, dest, category, String::new(), size, None, cmd, source);
             self.name_guessed(id, guessed);
             if later {
-                self.queues[queue].items.push(id);
+                self.core.queues[queue].items.push(id);
             } else {
                 self.start(id, true);
             }
@@ -2426,7 +2451,7 @@ impl App {
         context: &ipc::Command,
         direct: bool,
     ) -> RequestParts {
-        let site_login = self.settings.site_login(url);
+        let site_login = self.core.settings.site_login(url);
         let url_login = mdm_engine::ftp::is_ftp(url)
             .then(|| url_login(url))
             .flatten();
@@ -2445,19 +2470,19 @@ impl App {
                 headers.insert(name, v);
             }
         }
-        let ua = self.settings.user_agent.trim();
+        let ua = self.core.settings.user_agent.trim();
         let opts = Options {
-            max_connections: self.settings.connections_for(url),
-            proxy: self.settings.proxy_for(context),
-            dns: self.settings.dns(),
+            max_connections: self.core.settings.connections_for(url),
+            proxy: self.core.settings.proxy_for(context),
+            dns: self.core.settings.dns(),
             route: self.route.clone(),
             // Through a debrid account when one takes this host (#44).
             unlocker: self.debrid_route().unlocker(url, direct),
-            global: Some(self.global.clone()),
-            host_limits: Some(self.host_limits.clone()),
-            ignore_mtime: self.settings.ignore_mtime,
-            server_time: self.settings.set_creation_date,
-            ftp_passive: self.settings.ftp_passive,
+            global: Some(self.core.global.clone()),
+            host_limits: Some(self.core.host_limits.clone()),
+            ignore_mtime: self.core.settings.ignore_mtime,
+            server_time: self.core.settings.set_creation_date,
+            ftp_passive: self.core.settings.ftp_passive,
             user_agent: match context.user_agent.as_deref() {
                 Some(browser) => browser.to_owned(),
                 None if ua.is_empty() => Options::default().user_agent,
@@ -2483,22 +2508,23 @@ impl App {
     /// (`place_to_take`). The name stays the address's guess if it was one.
     fn claim_place(&mut self, id: u64) {
         let target = self
+            .core
             .items
             .iter()
             .find(|i| i.id == id)
-            .and_then(|i| place_to_take(i, &self.items));
+            .and_then(|i| place_to_take(i, &self.core.items));
         if let (Some(target), Some(item)) = (target, self.item(id)) {
             let guessed = item.name_from_url;
             take_place(item, target);
             item.name_from_url = guessed;
-            self.dirty = true;
+            self.core.dirty = true;
         }
     }
 
     /// Start or resume a download; `show` opens its progress dialog (IDM's default).
     fn start(&mut self, id: u64, show: bool) {
-        self.stopped_by_hand.remove(&id);
-        let rt = self.rt.clone();
+        self.core.stopped_by_hand.remove(&id);
+        let rt = self.core.rt.clone();
         let Some(item) = self.item(id) else { return };
         // A finished gallery may start again: it fetches the files not there yet (#58).
         if item.live.is_some() || (item.status == Status::Complete && item.gallery.is_none()) {
@@ -2515,9 +2541,9 @@ impl App {
             return;
         }
         // The download limit is reached: it starts when the window has room again.
-        if self.settings.limits_on && self.quota.blocked {
-            if !self.quota.held.contains(&id) {
-                self.quota.held.push(id);
+        if self.core.settings.limits_on && self.core.quota.blocked {
+            if !self.core.quota.held.contains(&id) {
+                self.core.quota.held.push(id);
             }
             if let Some(item) = self.item(id) {
                 item.status = Status::Queued;
@@ -2525,7 +2551,7 @@ impl App {
                     "Waiting: the download limit is reached (Scheduler)",
                 ));
             }
-            self.dirty = true;
+            self.core.dirty = true;
             return;
         }
         if self.item(id).is_some_and(|i| i.torrent.is_some()) {
@@ -2550,13 +2576,13 @@ impl App {
             return;
         };
         // The browser's proxy needs its VPN extension's own login (#42): said, never bypassed.
-        if let Some(why) = self.settings.browser_proxy_refused(&context) {
+        if let Some(why) = self.core.settings.browser_proxy_refused(&context) {
             if let Some(item) = self.item(id) {
                 item.status = Status::Error;
                 item.error = Some(why);
                 item.last_try = Some(model::now_stamp());
             }
-            self.dirty = true;
+            self.core.dirty = true;
             return;
         }
         let RequestParts { headers, mut opts } =
@@ -2564,7 +2590,7 @@ impl App {
         // Download File Info's open answer for it, if it has one (#28); used once.
         let kept = self.kept_answers.remove(&id);
         // The file's own remembered limit, else the Speed Limiter's.
-        opts.speed_limit = own_limit.or(self.settings.speed_limit());
+        opts.speed_limit = own_limit.or(self.core.settings.speed_limit());
         opts.checksum = checksum;
         self.claim_place(id);
         let Some(item) = self.item(id) else { return };
@@ -2579,7 +2605,7 @@ impl App {
                     item.status = Status::Error;
                     item.error = Some(crate::errors::describe(&e));
                     item.last_try = Some(model::now_stamp());
-                    self.dirty = true;
+                    self.core.dirty = true;
                     return;
                 }
             }
@@ -2616,46 +2642,30 @@ impl App {
         item.status = Status::Downloading;
         item.error = None;
         item.last_try = Some(model::now_stamp());
-        self.dirty = true;
+        self.core.dirty = true;
         if show && !self.progress.iter().any(|p| p.id == id) {
             self.progress
-                .push(Progress::new(id, self.settings.show_complete));
+                .push(Progress::new(id, self.core.settings.show_complete));
         }
     }
 
     /// Apply the Speed Limiter's "for one file" setting to every running download, file or
     /// torrent; one with a remembered limit of its own keeps it, as when it starts.
     fn apply_speed_limit(&self) {
-        let limit = self.settings.speed_limit();
-        for i in &self.items {
-            if let Some(l) = &i.live {
-                l.dl.set_speed_limit(i.own_limit.or(limit));
-            }
-        }
+        self.core.apply_speed_limit();
     }
 
     fn stop(&mut self, id: u64) {
-        if let Some(l) = self.item(id).and_then(|i| i.live.as_ref()) {
-            l.dl.cancel();
-        }
+        self.core.stop(id);
     }
 
     /// The user's Stop (or Pause): it stays stopped, even in a queue that is running (#341).
     fn stop_by_hand(&mut self, id: u64) {
-        self.stop(id);
-        self.stopped_by_hand.insert(id);
+        self.core.stop_by_hand(id);
     }
 
     fn stop_all(&mut self) {
-        let running: Vec<u64> = self
-            .items
-            .iter()
-            .filter(|i| i.live.is_some())
-            .map(|i| i.id)
-            .collect();
-        for id in running {
-            self.stop_by_hand(id);
-        }
+        self.core.stop_all();
     }
 
     /// Take a download off the list; its files stay.
@@ -2681,9 +2691,9 @@ impl App {
     fn remove_download(&mut self, id: u64, files: bool) {
         if self.item(id).is_some_and(|i| i.live.is_none()) {
             if let Some(spec) = self.item(id).and_then(|i| i.torrent.clone()) {
-                self.torrent_host.forget(&self.rt, &spec.hash, files);
+                self.torrent_host.forget(&self.core.rt, &spec.hash, files);
             } else if files
-                && let Some(i) = self.items.iter().find(|i| i.id == id)
+                && let Some(i) = self.core.items.iter().find(|i| i.id == id)
                 // A gallery's folder stays (it may hold other files; #58).
                 && i.gallery.is_none()
             {
@@ -2707,13 +2717,13 @@ impl App {
                 let _ = std::fs::remove_file(mdm_engine::naming::part_path(&i.dest));
                 let _ = std::fs::remove_file(state_path(&i.dest));
             }
-            self.items.retain(|i| i.id != id);
-            for q in &mut self.queues {
+            self.core.items.retain(|i| i.id != id);
+            for q in &mut self.core.queues {
                 q.items.retain(|i| *i != id);
             }
             self.progress.retain(|p| p.id != id);
             self.selection.forget(id);
-            self.dirty = true;
+            self.core.dirty = true;
         }
     }
 
@@ -2723,14 +2733,19 @@ impl App {
     fn ask_delete(&mut self, ids: Vec<u64>, files: bool) {
         let gone: Vec<&Item> = ids
             .iter()
-            .filter_map(|id| self.items.iter().find(|i| i.id == *id && i.live.is_none()))
+            .filter_map(|id| {
+                self.core
+                    .items
+                    .iter()
+                    .find(|i| i.id == *id && i.live.is_none())
+            })
             .collect();
         let Some(first) = gone.first() else { return };
         // Shift+Delete ticks "also the files" this once; only a plain Delete's answer is
         // remembered (else one Shift+Delete made every later Delete erase files).
         let shift = files;
-        let files = files || self.settings.delete_files_too;
-        if self.settings.confirm_delete {
+        let files = files || self.core.settings.delete_files_too;
+        if self.core.settings.confirm_delete {
             let one = gone.len() == 1;
             let mut ask = dialogs::ConfirmDelete::new(
                 gone.iter().map(|i| i.id).collect(),
@@ -2748,6 +2763,7 @@ impl App {
 
     fn delete_completed(&mut self) {
         let done = self
+            .core
             .items
             .iter()
             .filter(|i| i.status == Status::Complete)
@@ -2764,7 +2780,7 @@ impl App {
     /// Both sides' speeds are measured each frame: the torrents' as the torrent session's
     /// download limit, file downloads' as the global limiter they wait on.
     fn apply_global_limit(&mut self) {
-        let s = &self.settings;
+        let s = &self.core.settings;
         #[cfg(windows)]
         let active = crate::win32::idle_seconds() < 60;
         #[cfg(not(windows))]
@@ -2792,8 +2808,8 @@ impl App {
         }
         self.torrent_host.set_cap(self.torrent_cap.0);
         let for_files = rate.map(|cap| share(cap, torrents));
-        if self.global.get() != for_files {
-            self.global.set(for_files);
+        if self.core.global.get() != for_files {
+            self.core.global.set(for_files);
         }
     }
 
@@ -2802,7 +2818,7 @@ impl App {
     /// rates read high and low by a quarter, which tipped the split.)
     fn file_speed(&mut self) -> f64 {
         let now = Instant::now();
-        let taken = self.global.taken();
+        let taken = self.core.global.taken();
         let (speed, at, before) = self.file_speed;
         let dt = now.duration_since(at).as_secs_f64();
         if dt <= 0.0 {
@@ -2813,6 +2829,7 @@ impl App {
         let mut speed = speed + (new / dt - speed) * k;
         // None running: 0 at once, so the torrents take the whole cap back in one step.
         if !self
+            .core
             .items
             .iter()
             .any(|i| matches!(i.live.as_ref().map(|l| &l.dl), Some(model::Job::File(_))))
@@ -2830,7 +2847,7 @@ impl App {
         let now = Instant::now();
         let mut seen = HashMap::new();
         let mut new = 0u64;
-        for i in &self.items {
+        for i in &self.core.items {
             let Some(model::Job::Torrent(handle)) = i.live.as_ref().map(|l| &l.dl) else {
                 continue;
             };
@@ -2862,6 +2879,7 @@ impl App {
     #[cfg_attr(not(windows), allow(dead_code))]
     fn overall_progress(&self) -> Option<f64> {
         let (done, total) = self
+            .core
             .items
             .iter()
             .filter(|i| i.live.is_some())
@@ -2984,20 +3002,20 @@ impl App {
                 ctx,
                 icon.rgba.clone(),
                 icon.width,
-                self.settings.speed_limit_on,
+                self.core.settings.speed_limit_on,
             );
-            self.tray_limiter = Some(self.settings.speed_limit_on);
+            self.tray_limiter = Some(self.core.settings.speed_limit_on);
             if self.tray.is_some() {
                 tracing::info!("tray icon shown");
             }
         }
         if let Some(t) = &self.tray
-            && self.tray_limiter != Some(self.settings.speed_limit_on)
+            && self.tray_limiter != Some(self.core.settings.speed_limit_on)
         {
-            t.set_limiter(self.settings.speed_limit_on);
-            self.tray_limiter = Some(self.settings.speed_limit_on);
+            t.set_limiter(self.core.settings.speed_limit_on);
+            self.tray_limiter = Some(self.core.settings.speed_limit_on);
         }
-        if let (Some(t), Some(q)) = (&self.tray, self.queues.first()) {
+        if let (Some(t), Some(q)) = (&self.tray, self.core.queues.first()) {
             t.set_queue(q.running);
         }
         if let Some(t) = &self.tray {
@@ -3008,6 +3026,7 @@ impl App {
             t.set_tooltip(&tip);
             // "Downloads in progress": each running download, to show its progress window (#63).
             let running: Vec<(u64, String)> = self
+                .core
                 .items
                 .iter()
                 .filter(|i| i.live.is_some())
@@ -3048,7 +3067,7 @@ impl App {
         // off, no tray at all, or Linux with no tray host (#59: a hidden window couldn't come
         // back, and one that merely minimized could never be closed).
         if !self.exiting && ctx.input(|i| i.viewport().close_requested()) {
-            let keep = self.tray.is_some() && self.settings.close_to_tray;
+            let keep = self.tray.is_some() && self.core.settings.close_to_tray;
             if keep && self.tray_shown_now() {
                 tracing::info!("close: hidden to the notification area");
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -3070,7 +3089,7 @@ impl App {
         #[cfg(not(target_os = "linux"))]
         let can_hide = true;
         let wanted = self.tray.is_some()
-            && self.settings.minimize_to_tray
+            && self.core.settings.minimize_to_tray
             && can_hide
             && !self.exiting
             && self.tray_shown();
@@ -3133,7 +3152,7 @@ impl App {
     /// it, so Download File Info opens with it (unless that window is turned off). Only read,
     /// never written; on by default.
     fn watch_clipboard(&mut self, ctx: &egui::Context) {
-        if !self.settings.clipboard_autostart {
+        if !self.core.settings.clipboard_autostart {
             self.clip_seen = None;
             return;
         }
@@ -3174,7 +3193,7 @@ impl App {
             return;
         };
         let name = mdm_engine::naming::file_name(None, &url);
-        if mdm_engine::supported(&url) && self.settings.clipboard_type(&name) {
+        if mdm_engine::supported(&url) && self.core.settings.clipboard_type(&name) {
             let cmd = ipc::Command {
                 url: Some(text),
                 ..Default::default()
@@ -3193,7 +3212,7 @@ impl App {
             return;
         }
         let route = self.debrid_route();
-        if let Some(item) = self.items.iter().find(|i| i.id == id) {
+        if let Some(item) = self.core.items.iter().find(|i| i.id == id) {
             self.properties
                 .push(crate::properties::Properties::new(item, route));
         }
@@ -3249,7 +3268,7 @@ impl App {
             .move_to
             .filter(|dir| item.dest.parent() != Some(dir.as_path()))
             .map(|dir| mdm_engine::naming::destination(&dir, &item.file_name));
-        self.dirty = true;
+        self.core.dirty = true;
         if let Some(target) = move_to {
             self.start_move(c.id, target);
         }
@@ -3266,7 +3285,7 @@ impl App {
         if item.status != Status::Complete {
             if item.downloaded == 0 {
                 take_place(item, target);
-                self.dirty = true;
+                self.core.dirty = true;
             }
             return;
         }
@@ -3297,7 +3316,7 @@ impl App {
                     if let Some(item) = self.item(id) {
                         take_place(item, target);
                     }
-                    self.dirty = true;
+                    self.core.dirty = true;
                 }
                 Err(e) => {
                     if let Some(item) = self.item(id) {
@@ -3320,10 +3339,10 @@ impl App {
     fn find_next(&mut self, q: &crate::find::Query) {
         let shown = self.shown_ids();
         let found = q
-            .next(&shown, &self.items, self.selection.focus())
+            .next(&shown, &self.core.items, self.selection.focus())
             .or_else(|| {
                 self.view = View::All;
-                q.next(&self.shown_ids(), &self.items, self.selection.focus())
+                q.next(&self.shown_ids(), &self.core.items, self.selection.focus())
             });
         match found {
             Some(id) => {
@@ -3348,7 +3367,7 @@ impl App {
             .dest
             .parent()
             .map(PathBuf::from)
-            .unwrap_or_else(|| self.downloads.clone());
+            .unwrap_or_else(|| self.core.downloads.clone());
         let name = add
             .dest
             .file_name()
@@ -3356,7 +3375,7 @@ impl App {
             .unwrap_or_else(|| "video".into());
         // yt-dlp takes any `<stem>.*` there as its own: a stem no file and no other download
         // in the folder has, whatever the extension (#32).
-        let items = &self.items;
+        let items = &self.core.items;
         let dest = mdm_engine::naming::stem_destination(&folder, &name, |stem| {
             items.iter().any(|i| {
                 i.dest.parent() == Some(folder.as_path())
@@ -3383,15 +3402,15 @@ impl App {
         }
         // The Subtitles choice is offered again for the next video (#68).
         if let Some(subs) = add.remember {
-            self.settings.video_subs = subs;
+            self.core.settings.video_subs = subs;
         }
         self.selection.set(id);
         if add.start_now {
             self.start(id, true);
         } else {
-            self.queue_later(vec![id], self.settings.queue_panel_later);
+            self.queue_later(vec![id], self.core.settings.queue_panel_later);
         }
-        self.dirty = true;
+        self.core.dirty = true;
     }
 
     /// A playlist's videos (#69), one download each, into its folder: names picked with the
@@ -3401,6 +3420,7 @@ impl App {
         let started = Instant::now();
         let folder = add.folder;
         let in_use = self
+            .core
             .items
             .iter()
             .filter(|i| i.dest.parent() == Some(folder.as_path()))
@@ -3408,7 +3428,7 @@ impl App {
             .map(|s| s.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         let mut stems = mdm_engine::naming::Stems::new(&folder, in_use);
-        self.items.reserve(add.entries.len());
+        self.core.items.reserve(add.entries.len());
         let mut ids = Vec::with_capacity(add.entries.len());
         for (page, title) in add.entries {
             let stem = mdm_engine::naming::sanitize(&title);
@@ -3425,7 +3445,7 @@ impl App {
                 crate::i18n::mark("from a playlist (yt-dlp)"),
             );
             // push_item adds at the end: no search through the list for each one.
-            if let Some(item) = self.items.last_mut() {
+            if let Some(item) = self.core.items.last_mut() {
                 item.video = Some(model::VideoSpec {
                     selector: add.selector.clone(),
                     subs: Default::default(),
@@ -3436,12 +3456,12 @@ impl App {
         let Some(&first) = ids.first() else { return };
         self.selection.set(first);
         if add.start_now {
-            self.queues[0].items.extend(ids.iter().copied());
+            self.core.queues[0].items.extend(ids.iter().copied());
             self.start_queue(0);
         } else {
-            self.queue_later(ids.clone(), self.settings.queue_panel_later);
+            self.queue_later(ids.clone(), self.core.settings.queue_panel_later);
         }
-        self.dirty = true;
+        self.core.dirty = true;
         eprintln!(
             "playlist: {} downloads added in {} ms",
             ids.len(),
@@ -3455,7 +3475,7 @@ impl App {
         let tools = mdm_tools::tools_dir();
         let tool = tools.as_deref().and_then(mdm_tools::installed);
         let ffmpeg = tools.as_deref().and_then(mdm_tools::ffmpeg::installed);
-        let rate = self.settings.speed_limit();
+        let rate = self.core.settings.speed_limit();
         let Some(item) = self.item(id) else { return };
         let Some(spec) = item.video.clone() else {
             return;
@@ -3468,7 +3488,7 @@ impl App {
                 )
                 .into(),
             );
-            self.dirty = true;
+            self.core.dirty = true;
             return;
         };
         let folder = item.dest.parent().map(PathBuf::from).unwrap_or_default();
@@ -3507,10 +3527,10 @@ impl App {
                 item.error = Some(e.to_string());
             }
         }
-        self.dirty = true;
+        self.core.dirty = true;
         if show && !self.progress.iter().any(|p| p.id == id) {
             self.progress
-                .push(Progress::new(id, self.settings.show_complete));
+                .push(Progress::new(id, self.core.settings.show_complete));
         }
     }
 
@@ -3528,7 +3548,7 @@ impl App {
             // i18n: where a download came from, in its log: an image gallery, by gallery-dl
             crate::i18n::mark("from a gallery (gallery-dl)"),
         );
-        if let Some(item) = self.items.last_mut() {
+        if let Some(item) = self.core.items.last_mut() {
             item.file_name = add.name;
             item.gallery = Some(model::GallerySpec { limit: add.limit });
         }
@@ -3536,9 +3556,9 @@ impl App {
         if add.start_now {
             self.start(id, true);
         } else {
-            self.queue_later(vec![id], self.settings.queue_panel_later);
+            self.queue_later(vec![id], self.core.settings.queue_panel_later);
         }
-        self.dirty = true;
+        self.core.dirty = true;
     }
 
     /// Start (or start again) a gallery: gallery-dl, installed and verified, or the person's.
@@ -3546,7 +3566,7 @@ impl App {
         let tool = mdm_tools::tools_dir()
             .as_deref()
             .and_then(mdm_tools::gallery::installed);
-        let rate = self.settings.speed_limit();
+        let rate = self.core.settings.speed_limit();
         let Some(item) = self.item(id) else { return };
         let Some(spec) = item.gallery.clone() else {
             return;
@@ -3560,7 +3580,7 @@ impl App {
                 )
                 .into(),
             );
-            self.dirty = true;
+            self.core.dirty = true;
             return;
         };
         let ask = mdm_tools::gallery::Ask {
@@ -3595,16 +3615,17 @@ impl App {
                 item.error = Some(e.to_string());
             }
         }
-        self.dirty = true;
+        self.core.dirty = true;
         if show && !self.progress.iter().any(|p| p.id == id) {
             self.progress
-                .push(Progress::new(id, self.settings.show_complete));
+                .push(Progress::new(id, self.core.settings.show_complete));
         }
     }
 
     /// The info hashes of every torrent in the list (also used to prevent duplicate adds).
     fn torrent_hashes(&self) -> std::collections::HashSet<String> {
-        self.items
+        self.core
+            .items
             .iter()
             .filter_map(|i| i.torrent.as_ref().map(|t| t.hash.clone()))
             .collect()
@@ -3612,12 +3633,13 @@ impl App {
 
     /// The hashes librqbit should keep or restore in its session.
     fn session_hashes(&self) -> std::collections::HashSet<String> {
-        let limits = self.settings.sharing_limits();
-        self.items
+        let limits = self.core.settings.sharing_limits();
+        self.core
+            .items
             .iter()
             .filter(|i| {
                 i.status != Status::Complete
-                    || (self.settings.torrent_keep_sharing
+                    || (self.core.settings.torrent_keep_sharing
                         && i.torrent.as_ref().is_some_and(|spec| {
                             crate::torrents::sharing_limit_reached(spec, i.downloaded, limits)
                                 .is_none()
@@ -3631,8 +3653,9 @@ impl App {
     /// The finished torrents to share (Torrent settings' "Keep sharing"): those that haven't
     /// reached a seeding limit.
     fn complete_torrents(&self) -> Vec<String> {
-        let limits = self.settings.sharing_limits();
-        self.items
+        let limits = self.core.settings.sharing_limits();
+        self.core
+            .items
             .iter()
             .filter(|i| i.status == Status::Complete)
             .filter_map(|i| i.torrent.as_ref().map(|t| (t, i.downloaded)))
@@ -3665,8 +3688,9 @@ impl App {
                 })
         {
             let dir = self
+                .core
                 .settings
-                .category_dir(Category::Torrents, &self.downloads);
+                .category_dir(Category::Torrents, &self.core.downloads);
             self.add_remote_torrent(magnet, dir, Category::Torrents, true);
             self.show_window(ctx);
             return;
@@ -3679,9 +3703,9 @@ impl App {
             remote,
             self.torrent_host.clone(),
             self.session_hashes(),
-            self.downloads.clone(),
-            self.settings.category_dirs.clone(),
-            &self.rt,
+            self.core.downloads.clone(),
+            self.core.settings.category_dirs.clone(),
+            &self.core.rt,
             ctx,
         ));
     }
@@ -3689,7 +3713,7 @@ impl App {
     /// The debrid account torrents go to (#44): Options → Accounts' "Torrents and magnet links
     /// through the first account", with an account there.
     fn torrent_account(&self) -> Option<(u64, mdm_debrid::ServiceKind)> {
-        (self.settings.debrid_on && self.settings.debrid_torrents)
+        (self.core.settings.debrid_on && self.core.settings.debrid_torrents)
             .then(|| self.debrid.torrent_account())
             .flatten()
     }
@@ -3740,14 +3764,14 @@ impl App {
         if start_now {
             self.start(id, true);
         } else {
-            self.queue_later(vec![id], self.settings.queue_panel_later);
+            self.queue_later(vec![id], self.core.settings.queue_panel_later);
         }
-        self.dirty = true;
+        self.core.dirty = true;
     }
 
     /// Start (or continue) a torrent through its debrid account (#44).
     fn start_remote(&mut self, id: u64, show: bool) {
-        let limit = self.settings.speed_limit();
+        let limit = self.core.settings.speed_limit();
         let Some((url, spec, own)) = self
             .item(id)
             .and_then(|i| Some((i.url.clone(), i.remote.clone()?, i.own_limit)))
@@ -3760,7 +3784,7 @@ impl App {
             .request_parts(&url, None, &Default::default(), true)
             .opts;
         net.speed_limit = own.or(limit);
-        let rt = self.rt.clone();
+        let rt = self.core.rt.clone();
         let _guard = rt.enter();
         let job = mdm_debrid::torrents::RemoteTorrent::start(
             &self.debrid,
@@ -3783,10 +3807,10 @@ impl App {
         item.status = Status::Downloading;
         item.error = None;
         item.last_try = Some(model::now_stamp());
-        self.dirty = true;
+        self.core.dirty = true;
         if show && !self.progress.iter().any(|p| p.id == id) {
             self.progress
-                .push(Progress::new(id, self.settings.show_complete));
+                .push(Progress::new(id, self.core.settings.show_complete));
         }
     }
 
@@ -3850,12 +3874,12 @@ impl App {
         self.selection.set(id);
         if add.start_now {
             self.start(id, !add.quiet);
-        } else if let Some(q) = add.queue.filter(|q| *q < self.queues.len()) {
-            self.queues[q].items.push(id);
+        } else if let Some(q) = add.queue.filter(|q| *q < self.core.queues.len()) {
+            self.core.queues[q].items.push(id);
         } else {
-            self.queue_later(vec![id], self.settings.queue_panel_later);
+            self.queue_later(vec![id], self.core.settings.queue_panel_later);
         }
-        self.dirty = true;
+        self.core.dirty = true;
     }
 
     /// Right-click → Torrent → Download in order (`in_order`), or its first and last pieces
@@ -3877,15 +3901,15 @@ impl App {
         {
             run.set_order(order);
         }
-        self.dirty = true;
+        self.core.dirty = true;
     }
 
     /// Start a torrent: the session adds or resumes it.
     fn start_torrent(&mut self, id: u64, show: bool) {
-        let auto_share = self.settings.torrent_keep_sharing;
+        let auto_share = self.core.settings.torrent_keep_sharing;
         let known = self.session_hashes();
-        let limit = self.settings.speed_limit();
-        let (host, rt) = (self.torrent_host.clone(), self.rt.clone());
+        let limit = self.core.settings.speed_limit();
+        let (host, rt) = (self.torrent_host.clone(), self.core.rt.clone());
         let Some(item) = self.item(id) else { return };
         // An explicit Start on a completed download means seed it, even when automatic
         // keep sharing is off. It remains in the session until Stop or a sharing limit.
@@ -3914,10 +3938,10 @@ impl App {
         item.status = Status::Downloading;
         item.error = None;
         item.last_try = Some(model::now_stamp());
-        self.dirty = true;
+        self.core.dirty = true;
         if show && !self.progress.iter().any(|p| p.id == id) {
             self.progress
-                .push(Progress::new(id, self.settings.show_complete));
+                .push(Progress::new(id, self.core.settings.show_complete));
         }
     }
 
@@ -3982,7 +4006,7 @@ impl App {
         }
         let url = feed.url.clone();
         let out = self.rss_events.clone();
-        self.rt.spawn(async move {
+        self.core.rt.spawn(async move {
             let res = match url::Url::parse(&url) {
                 Ok(url) => {
                     let remote = crate::torrents::Remote {
@@ -4013,7 +4037,7 @@ impl App {
             self.session_hashes(),
             self.rss_events.clone(),
         );
-        self.rt.spawn(async move {
+        self.core.rt.spawn(async move {
             let res = async {
                 let src = match mdm_torrent::Source::magnet(&article.torrent) {
                     Some(m) => m,
@@ -4091,8 +4115,9 @@ impl App {
             return;
         }
         let dir = if r.folder.trim().is_empty() {
-            self.settings
-                .category_dir(Category::Torrents, &self.downloads)
+            self.core
+                .settings
+                .category_dir(Category::Torrents, &self.core.downloads)
         } else {
             PathBuf::from(r.folder.trim())
         };
@@ -4152,6 +4177,7 @@ impl App {
         );
         self.save_rss();
         if let Some(item) = self
+            .core
             .items
             .iter_mut()
             .find(|i| i.torrent.as_ref().is_some_and(|t| t.hash == hash))
@@ -4170,6 +4196,7 @@ impl App {
     fn torrent_act(&mut self, id: u64, act: crate::torrents::Act) {
         let known = self.session_hashes();
         let Some(spec) = self
+            .core
             .items
             .iter()
             .find(|i| i.id == id)
@@ -4180,7 +4207,7 @@ impl App {
         if self.torrent_host.busy(&spec.hash) {
             return;
         }
-        self.torrent_host.act(&self.rt, known, &spec, act);
+        self.torrent_host.act(&self.core.rt, known, &spec, act);
     }
 
     /// Files ticked or unticked in a torrent's Files tab (#39): the torrent downloads `files`
@@ -4211,7 +4238,7 @@ impl App {
             "{n} files chosen to download",
         );
         item.note(note);
-        self.dirty = true;
+        self.core.dirty = true;
         self.torrent_act(
             id,
             crate::torrents::Act::Choose {
@@ -4227,6 +4254,7 @@ impl App {
         use crate::torrents::{Act, Done};
         for o in self.torrent_host.take_outcomes() {
             let Some(item) = self
+                .core
                 .items
                 .iter_mut()
                 .find(|i| i.torrent.as_ref().is_some_and(|t| t.hash == o.hash))
@@ -4274,7 +4302,7 @@ impl App {
                 ),
             };
             item.note(note);
-            self.dirty = true;
+            self.core.dirty = true;
         }
     }
 
@@ -4285,7 +4313,10 @@ impl App {
         for url in added.urls {
             let name = mdm_engine::naming::file_name(None, &url);
             let category = Category::of(&name);
-            let dir = self.settings.category_dir(category, &self.downloads);
+            let dir = self
+                .core
+                .settings
+                .category_dir(category, &self.core.downloads);
             let dest = mdm_engine::naming::destination(&dir, &name);
             let id = self.push_item(
                 url,
@@ -4300,8 +4331,8 @@ impl App {
             self.name_guessed(id, true);
             ids.push(id);
         }
-        self.queue_later(ids, self.settings.queue_panel_batch);
-        self.dirty = true;
+        self.queue_later(ids, self.core.settings.queue_panel_batch);
+        self.core.dirty = true;
     }
 
     /// The automation API's answer (a JSON line, shaped by `ipc::api`): `api` turns it on or
@@ -4316,7 +4347,7 @@ impl App {
             return self.pair_answer();
         }
         if cmd.remote {
-            if !self.settings.remote_on {
+            if !self.core.settings.remote_on {
                 return line(&ErrorAnswer {
                     error: "the remote control is off".into(),
                     code: Some("remote-off".into()),
@@ -4326,10 +4357,10 @@ impl App {
                 return self.remote_add(cmd.clone());
             }
         } else if let Some(on) = cmd.api {
-            self.settings.automation_api = on;
-            self.dirty = true;
+            self.core.settings.automation_api = on;
+            self.core.dirty = true;
             return line(&ApiAnswer { api: on });
-        } else if !self.settings.automation_api {
+        } else if !self.core.settings.automation_api {
             return line(&ErrorAnswer {
                 error: "the automation API is off (misterdownloadmanager-cli api on)".into(),
                 code: Some(ipc::api::API_OFF.into()),
@@ -4339,7 +4370,7 @@ impl App {
             let at = cmd
                 .queue
                 .as_deref()
-                .and_then(|n| self.queues.iter().position(|q| q.name == n));
+                .and_then(|n| self.core.queues.iter().position(|q| q.name == n));
             let Some(q) = at else {
                 return line(&ErrorAnswer {
                     error: "no such queue".into(),
@@ -4351,7 +4382,7 @@ impl App {
             } else {
                 self.stop_queue(q);
             }
-            self.dirty = true;
+            self.core.dirty = true;
             return line(&ipc::api::ActAnswer::default());
         }
         if let Some(action) = cmd.action.as_deref() {
@@ -4363,6 +4394,7 @@ impl App {
         match cmd.query.as_deref() {
             Some("list") => {
                 let downloads = self
+                    .core
                     .items
                     .iter()
                     .map(|i| DownloadInfo {
@@ -4392,12 +4424,14 @@ impl App {
                     })
                     .collect();
                 let speed: f64 = self
+                    .core
                     .items
                     .iter()
                     .filter(|i| i.live.is_some())
                     .map(|i| i.rate())
                     .sum();
                 let queues = self
+                    .core
                     .queues
                     .iter()
                     .map(|q| ipc::api::QueueInfo {
@@ -4462,10 +4496,11 @@ impl App {
         if checked.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
             self.free_space.lock().unwrap().0 = Some(Instant::now());
             let dir = self
+                .core
                 .settings
-                .category_dir(Category::General, &self.downloads);
+                .category_dir(Category::General, &self.core.downloads);
             let slot = self.free_space.clone();
-            self.rt.spawn_blocking(move || {
+            self.core.rt.spawn_blocking(move || {
                 // The folder may not exist yet: its nearest existing parent's volume.
                 let at = dir
                     .ancestors()
@@ -4501,7 +4536,7 @@ impl App {
         };
         let queue = match cmd.queue.as_deref() {
             None => None,
-            Some(name) => match self.queues.iter().position(|q| q.name == name) {
+            Some(name) => match self.core.queues.iter().position(|q| q.name == name) {
                 Some(q) => Some(q),
                 None => return fail("unknown-queue", "no such queue"),
             },
@@ -4520,7 +4555,7 @@ impl App {
                 self.torrent_host.clone(),
                 self.session_hashes(),
             );
-            self.rt.spawn(async move {
+            self.core.rt.spawn(async move {
                 let res = match host.session(known).await {
                     Ok(t) => t
                         .metadata(&source, crate::torrentdlg::METADATA_WAIT, None)
@@ -4549,8 +4584,8 @@ impl App {
         };
         // Already in the list: no one at the computer to ask, so Options' choice, with "ask"
         // taken as "add it again" (under a numbered name).
-        if let Some(dup) = self.items.iter().find(|i| i.url == url).map(|i| i.id) {
-            match self.settings.duplicate_action {
+        if let Some(dup) = self.core.items.iter().find(|i| i.url == url).map(|i| i.id) {
+            match self.core.settings.duplicate_action {
                 2 => self.overwrite(dup),
                 3 => {
                     return line(&AddAnswer {
@@ -4563,7 +4598,10 @@ impl App {
         }
         let name = mdm_engine::naming::sanitize(&mdm_engine::naming::file_name(None, &url));
         let category = category.unwrap_or_else(|| Category::of(&name));
-        let dir = self.settings.category_dir(category, &self.downloads);
+        let dir = self
+            .core
+            .settings
+            .category_dir(category, &self.core.downloads);
         let dest = mdm_engine::naming::destination(&dir, &name);
         cmd.remote = false;
         let id = self.push_item(
@@ -4579,10 +4617,10 @@ impl App {
         );
         self.name_guessed(id, true);
         match queue {
-            Some(q) => self.queues[q].items.push(id),
+            Some(q) => self.core.queues[q].items.push(id),
             None => self.start(id, false),
         }
-        self.dirty = true;
+        self.core.dirty = true;
         line(&AddAnswer {
             id: Some(id),
             pending: false,
@@ -4615,8 +4653,8 @@ impl App {
             let category = category.unwrap_or_else(|| crate::torrentdlg::category_of(&meta));
             let dir = crate::model::category_folder(
                 category,
-                &self.downloads,
-                &self.settings.category_dirs,
+                &self.core.downloads,
+                &self.core.settings.category_dirs,
             );
             if !meta.existing_in(&dir).is_empty() {
                 tracing::warn!(
@@ -4699,7 +4737,7 @@ impl App {
     fn apply_options(&mut self, new: Settings) {
         new.publish_categories();
         // Portable mode writes nothing outside its folder (the option is off there).
-        if new.launch_on_startup != self.settings.launch_on_startup
+        if new.launch_on_startup != self.core.settings.launch_on_startup
             && mdm_ipc::portable_dir().is_none()
         {
             #[cfg(windows)]
@@ -4707,23 +4745,23 @@ impl App {
             #[cfg(unix)]
             crate::unix::set_run_at_startup(new.launch_on_startup);
         }
-        self.settings = new;
-        crate::regional::set(&self.settings.regional);
+        self.core.settings = new;
+        crate::regional::set(&self.core.settings.regional);
         // Options → Remote: listening started, stopped or moved.
         if let Some(r) = &self.remote {
-            r.apply(crate::remote::config(&self.settings));
+            r.apply(crate::remote::config(&self.core.settings));
         }
-        if self.settings.proxy_mode == 2 {
-            crate::pacfetch::refresh(&self.settings.proxy_script, &self.rt);
+        if self.core.settings.proxy_mode == 2 {
+            crate::pacfetch::refresh(&self.core.settings.proxy_script, &self.core.rt);
         }
         self.apply_speed_limit();
-        self.dirty = true;
+        self.core.dirty = true;
     }
 
     /// Options → Sounds: play the sound for event `i` (complete, failed, queue started,
     /// queue stopped/finished) when it is on.
     fn sound(&self, i: usize) {
-        if let Some((true, file)) = self.settings.sounds.get(i)
+        if let Some((true, file)) = self.core.settings.sounds.get(i)
             && !file.is_empty()
         {
             crate::options::play_sound(file);
@@ -4737,15 +4775,16 @@ impl App {
         match a {
             Action::Apply { queues, limits } => {
                 // A running queue the Scheduler deleted stops first (its downloads stay).
-                for q in 0..self.queues.len() {
-                    if self.queues[q].running
-                        && !queues.iter().any(|n| n.name == self.queues[q].name)
+                for q in 0..self.core.queues.len() {
+                    if self.core.queues[q].running
+                        && !queues.iter().any(|n| n.name == self.core.queues[q].name)
                     {
                         self.stop_queue(q);
                     }
                 }
                 // Running state belongs to the app, not the draft.
                 let running: Vec<String> = self
+                    .core
                     .queues
                     .iter()
                     .filter(|q| q.running)
@@ -4754,28 +4793,28 @@ impl App {
                 // The list showing a queue follows it to its new place (All Downloads when
                 // it is gone).
                 if let View::Queue(i) = self.view {
-                    let name = self.queues.get(i).map(|q| q.name.clone());
+                    let name = self.core.queues.get(i).map(|q| q.name.clone());
                     self.view = name
                         .and_then(|n| queues.iter().position(|q| q.name == n))
                         .map_or(View::All, View::Queue);
                 }
-                self.queues = queues;
-                for q in &mut self.queues {
+                self.core.queues = queues;
+                for q in &mut self.core.queues {
                     q.running = running.contains(&q.name);
                 }
-                self.settings.limits_on = limits.on;
-                self.settings.limits_mb = limits.mb;
-                self.settings.limits_hours = limits.hours;
-                self.settings.limits_warn = limits.warn;
-                self.dirty = true;
+                self.core.settings.limits_on = limits.on;
+                self.core.settings.limits_mb = limits.mb;
+                self.core.settings.limits_hours = limits.hours;
+                self.core.settings.limits_warn = limits.warn;
+                self.core.dirty = true;
             }
             Action::Start(name) => {
-                if let Some(q) = index(&self.queues, &name) {
+                if let Some(q) = index(&self.core.queues, &name) {
                     self.start_queue(q);
                 }
             }
             Action::Stop(name) => {
-                if let Some(q) = index(&self.queues, &name) {
+                if let Some(q) = index(&self.core.queues, &name) {
                     self.stop_queue(q);
                 }
             }
@@ -4783,19 +4822,19 @@ impl App {
     }
 
     fn start_queue(&mut self, q: usize) {
-        if !self.queues[q].running {
+        if !self.core.queues[q].running {
             self.sound(2);
         }
-        self.queues[q].running = true;
-        for id in &self.queues[q].items {
-            self.stopped_by_hand.remove(id);
+        self.core.queues[q].running = true;
+        for id in &self.core.queues[q].items {
+            self.core.stopped_by_hand.remove(id);
         }
         self.tick_queues();
     }
 
     fn stop_queue(&mut self, q: usize) {
-        self.queues[q].running = false;
-        for id in self.queues[q].items.clone() {
+        self.core.queues[q].running = false;
+        for id in self.core.queues[q].items.clone() {
             self.stop(id);
         }
     }
@@ -4803,7 +4842,8 @@ impl App {
     /// How a queue sees one of its downloads.
     /// Every download's standing for the queues, by id.
     fn members(&self, now: Instant) -> std::collections::HashMap<u64, Member> {
-        self.items
+        self.core
+            .items
             .iter()
             .map(|i| (i.id, self.member_of(i, now)))
             .collect()
@@ -4812,13 +4852,18 @@ impl App {
     fn member_of(&self, i: &Item, now: Instant) -> Member {
         let id = i.id;
         match i.status {
-            Status::Stopped if self.stopped_by_hand.contains(&id) => Member::Held,
+            Status::Stopped if self.core.stopped_by_hand.contains(&id) => Member::Held,
             Status::Queued | Status::Stopped => Member::Waiting,
             Status::Downloading => Member::Running,
             Status::Complete => Member::Complete,
             Status::Error => {
                 let long_ago = now.checked_sub(queue::RETRY_DELAY).unwrap_or(now);
-                let (at, tries) = self.failures.get(&id).copied().unwrap_or((long_ago, 0));
+                let (at, tries) = self
+                    .core
+                    .failures
+                    .get(&id)
+                    .copied()
+                    .unwrap_or((long_ago, 0));
                 Member::Failed { at, tries }
             }
         }
@@ -4828,17 +4873,17 @@ impl App {
     fn tick_queues(&mut self) {
         use chrono::Datelike;
         let now_s = seconds_now();
-        let prev = std::mem::replace(&mut self.clock, now_s);
+        let prev = std::mem::replace(&mut self.core.clock, now_s);
         let today = chrono::Local::now().date_naive();
         let weekday = today.weekday().num_days_from_sunday() as usize;
         let date = (today.year(), today.month(), today.day());
-        for q in 0..self.queues.len() {
-            let sch = self.queues[q].schedule.clone();
+        for q in 0..self.core.queues.len() {
+            let sch = self.core.queues[q].schedule.clone();
             if let Some(t) = sch.start_at
                 && sch.starts_on(date, weekday)
                 && queue::crossed(t, prev, now_s)
             {
-                self.queues[q].running = true;
+                self.core.queues[q].running = true;
             }
             if let Some(t) = sch.stop_at
                 && queue::crossed(t, prev, now_s)
@@ -4847,45 +4892,48 @@ impl App {
             }
         }
         let now = Instant::now();
-        for q in 0..self.queues.len() {
-            if !self.queues[q].running {
+        for q in 0..self.core.queues.len() {
+            if !self.core.queues[q].running {
                 continue;
             }
             // Each download's standing, looked up once (a linear search per queued id before).
             let members = self.members(now);
-            let starts = queue::to_start(&self.queues[q], |id| member_in(&members, id), now);
+            let starts = queue::to_start(&self.core.queues[q], |id| member_in(&members, id), now);
             for id in starts {
                 self.start(id, false);
             }
             let members = self.members(now);
-            if queue::finished(&self.queues[q], |id| member_in(&members, id)) {
-                self.queues[q].running = false;
+            if queue::finished(&self.core.queues[q], |id| member_in(&members, id)) {
+                self.core.queues[q].running = false;
                 self.queue_done(q);
             }
         }
         // The next wake follows the schedules (set again when they change), and a queue that
         // wakes the computer keeps it awake while it runs (#142).
-        self.wake.sync(&self.queues);
+        self.core.wake.sync(&self.core.queues);
         let waking = self
+            .core
             .queues
             .iter()
             .find(|q| q.running && q.schedule.wake)
             .map(|q| q.name.clone());
-        self.wake
+        self.core
+            .wake
             .keep_awake(waking.is_some(), waking.as_deref().unwrap_or_default());
     }
 
     /// Scheduler → Download limits: stop at the limit, go on when the window has room.
     fn check_limits(&mut self, now: Instant) {
-        self.quota
-            .record(now, self.items.iter().map(|i| (i.id, i.downloaded)));
-        let s = &self.settings;
+        self.core
+            .quota
+            .record(now, self.core.items.iter().map(|i| (i.id, i.downloaded)));
+        let s = &self.core.settings;
         let limit = u64::from(s.limits_mb.max(1)) << 20;
         let window = Duration::from_secs(u64::from(s.limits_hours.max(1)) * 3600);
         let change = if s.limits_on {
-            self.quota.check(now, limit, window)
-        } else if self.quota.blocked {
-            self.quota.blocked = false;
+            self.core.quota.check(now, limit, window)
+        } else if self.core.quota.blocked {
+            self.core.quota.blocked = false;
             Some(false)
         } else {
             None
@@ -4893,6 +4941,7 @@ impl App {
         match change {
             Some(true) => {
                 let running: Vec<u64> = self
+                    .core
                     .items
                     .iter()
                     .filter(|i| i.live.is_some())
@@ -4900,31 +4949,31 @@ impl App {
                     .collect();
                 for id in running {
                     self.stop(id);
-                    self.quota.held.push(id);
+                    self.core.quota.held.push(id);
                 }
-                for id in self.quota.held.clone() {
+                for id in self.core.quota.held.clone() {
                     if let Some(item) = self.item(id) {
                         item.status = Status::Queued;
                     }
                 }
-                if self.settings.limits_warn {
-                    let wait = self.quota.room_in(now, limit, window);
+                if self.core.settings.limits_warn {
+                    let wait = self.core.quota.room_in(now, limit, window);
                     self.limit_notice = Some(dialogs::LimitNotice::new(
-                        self.settings.limits_mb,
-                        self.settings.limits_hours,
+                        self.core.settings.limits_mb,
+                        self.core.settings.limits_hours,
                         wait,
                     ));
                 }
-                self.dirty = true;
+                self.core.dirty = true;
             }
             Some(false) => {
-                for id in std::mem::take(&mut self.quota.held) {
+                for id in std::mem::take(&mut self.core.quota.held) {
                     if let Some(item) = self.item(id) {
                         item.status = Status::Stopped;
                     }
                     self.start(id, false);
                 }
-                self.dirty = true;
+                self.core.dirty = true;
             }
             None => {}
         }
@@ -4933,7 +4982,7 @@ impl App {
     /// A queue ran out of work: its "when done" actions (Scheduler).
     fn queue_done(&mut self, q: usize) {
         self.sound(3);
-        let sch = self.queues[q].schedule.clone();
+        let sch = self.core.queues[q].schedule.clone();
         if let Some(path) = &sch.open_when_done {
             crate::launch::open(path);
         }
@@ -4959,14 +5008,14 @@ impl App {
     }
 
     fn open_item(&mut self, id: u64) {
-        let Some(i) = self.items.iter().find(|i| i.id == id) else {
+        let Some(i) = self.core.items.iter().find(|i| i.id == id) else {
             return;
         };
         if i.status == Status::Complete {
             crate::dialogs::open_file(&i.dest);
         } else if !self.progress.iter().any(|p| p.id == id) {
             self.progress
-                .push(Progress::new(id, self.settings.show_complete));
+                .push(Progress::new(id, self.core.settings.show_complete));
         } else if let Some(p) = self.progress.iter_mut().find(|p| p.id == id && p.hidden) {
             // Hidden in the tray (#63): back, as it was.
             p.hidden = false;
@@ -4988,10 +5037,12 @@ impl App {
         let many = self.targets(target);
         let target = target.or(self.selection.one());
         let dest = target
-            .and_then(|id| self.items.iter().find(|i| i.id == id))
+            .and_then(|id| self.core.items.iter().find(|i| i.id == id))
             .map(|i| i.dest.clone());
         match cmd {
-            Cmd::AddUrl => self.add_url = Some(AddUrl::from_clipboard(&self.settings.url_history)),
+            Cmd::AddUrl => {
+                self.add_url = Some(AddUrl::from_clipboard(&self.core.settings.url_history))
+            }
             Cmd::Exit => {
                 self.exiting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -5017,13 +5068,13 @@ impl App {
             Cmd::StartQueue(q) => self.start_queue(q),
             Cmd::StopQueue(q) => self.stop_queue(q),
             Cmd::Browse(c) => {
-                let dir = self.settings.category_dir(c, &self.downloads);
+                let dir = self.core.settings.category_dir(c, &self.core.downloads);
                 let _ = std::fs::create_dir_all(&dir);
                 crate::launch::open(dir);
             }
             Cmd::DoubleClickOpen(open) => {
-                self.settings.double_click_open = open;
-                self.dirty = true;
+                self.core.settings.double_click_open = open;
+                self.core.dirty = true;
             }
             Cmd::AddToQueue(q) => {
                 // "Move to queue" for a download already in one: it leaves that queue.
@@ -5031,67 +5082,68 @@ impl App {
                     .iter()
                     .copied()
                     .filter(|id| {
-                        self.items
+                        self.core
+                            .items
                             .iter()
                             .any(|i| i.id == *id && i.status == Status::Complete)
                     })
                     .collect();
                 for id in many {
                     // Finished files go only to synchronization queues.
-                    if done.contains(&id) && !self.queues[q].sync {
+                    if done.contains(&id) && !self.core.queues[q].sync {
                         continue;
                     }
-                    for (k, other) in self.queues.iter_mut().enumerate() {
+                    for (k, other) in self.core.queues.iter_mut().enumerate() {
                         if k != q {
                             other.items.retain(|x| *x != id);
                         }
                     }
-                    if !self.queues[q].items.contains(&id) {
-                        self.queues[q].items.push(id);
+                    if !self.core.queues[q].items.contains(&id) {
+                        self.core.queues[q].items.push(id);
                     }
                 }
-                self.dirty = true;
+                self.core.dirty = true;
             }
             Cmd::RemoveFromQueue => {
                 for id in many {
-                    for q in &mut self.queues {
+                    for q in &mut self.core.queues {
                         q.items.retain(|x| *x != id);
                     }
                 }
-                self.dirty = true;
+                self.core.dirty = true;
             }
             Cmd::ToggleCategories => self.show_categories = !self.show_categories,
             Cmd::ChooseLanguage => {
                 if self.lang_picker.is_none() {
                     self.lang_picker = Some(crate::langpick::Picker::new(
                         false,
-                        self.settings.language.as_deref(),
+                        self.core.settings.language.as_deref(),
                     ));
                 }
             }
             Cmd::Language(code) => {
-                self.settings.language = code.map(str::to_owned);
-                self.settings.language_asked = true;
+                self.core.settings.language = code.map(str::to_owned);
+                self.core.settings.language_asked = true;
                 crate::i18n::set_lang(code);
                 crate::theme::language_fonts(ctx);
                 if let Some(tray) = &self.tray {
                     tray.relabel();
                 }
-                self.dirty = true;
+                self.core.dirty = true;
                 ctx.request_repaint();
             }
             Cmd::ToggleDarkMode => {
-                self.settings.dark_mode_support = !self.settings.dark_mode_support;
+                self.core.settings.dark_mode_support = !self.core.settings.dark_mode_support;
                 self.theme_checked = None;
-                self.dirty = true;
+                self.core.dirty = true;
             }
             Cmd::ToggleAlwaysDark => {
-                self.settings.always_dark = !self.settings.always_dark;
+                self.core.settings.always_dark = !self.core.settings.always_dark;
                 self.theme_checked = None;
-                self.dirty = true;
+                self.core.dirty = true;
             }
             Cmd::Theme(id) => {
-                self.settings.theme = id.to_owned();
+                self.core.settings.theme = id.to_owned();
                 crate::theme::select(id, ctx);
                 // Live: egui's own visuals, the glyph rendering and the captions follow at once;
                 // every painter reads the new theme from its next frame.
@@ -5099,7 +5151,7 @@ impl App {
                 crate::theme::apply_mode(ctx);
                 self.caption_set = false;
                 self.theme_checked = None;
-                self.dirty = true;
+                self.core.dirty = true;
                 ctx.request_repaint();
             }
             Cmd::OpenThemesFolder => {
@@ -5139,8 +5191,8 @@ impl App {
                     crate::renderer::forget_failure();
                 }
                 tracing::info!("draw with {api:?} from the next start");
-                self.settings.renderer = Some(api);
-                self.dirty = true;
+                self.core.settings.renderer = Some(api);
+                self.core.dirty = true;
             }
             Cmd::Open => {
                 if let Some(id) = target {
@@ -5155,15 +5207,16 @@ impl App {
             Cmd::Extract => {
                 // Every chosen archive (a split one once, from whichever volume).
                 for id in self.targets(target) {
-                    if let Some(i) = self.items.iter().find(|i| i.id == id) {
-                        self.extracts.offer(i, &self.items, &self.settings, true);
+                    if let Some(i) = self.core.items.iter().find(|i| i.id == id) {
+                        self.extracts
+                            .offer(i, &self.core.items, &self.core.settings, true);
                     }
                 }
             }
             Cmd::VerifyChecksum => {
                 if let Some(id) = target
                     && !self.checksums.iter().any(|c| c.id == id)
-                    && let Some(i) = self.items.iter().find(|i| i.id == id)
+                    && let Some(i) = self.core.items.iter().find(|i| i.id == id)
                 {
                     let file = (i.status == Status::Complete).then(|| i.dest.clone());
                     self.checksums.push(crate::checksum::ChecksumDialog::new(
@@ -5178,6 +5231,7 @@ impl App {
                 // there; Properties takes the new address and the download resumes from it.
                 if let Some(id) = target {
                     let page = self
+                        .core
                         .items
                         .iter()
                         .find(|i| i.id == id)
@@ -5200,12 +5254,12 @@ impl App {
             }
             Cmd::ToggleColumn(i) => self.list.visible[i] = !self.list.visible[i],
             Cmd::LimiterOn | Cmd::LimiterOff => {
-                self.settings.speed_limit_on = cmd == Cmd::LimiterOn;
+                self.core.settings.speed_limit_on = cmd == Cmd::LimiterOn;
                 self.apply_speed_limit();
-                self.dirty = true;
+                self.core.dirty = true;
             }
             Cmd::LimiterSettings => {
-                self.speed_settings = Some(dialogs::SpeedSettings::new(&self.settings));
+                self.speed_settings = Some(dialogs::SpeedSettings::new(&self.core.settings));
             }
             Cmd::Find => {
                 if self.find.is_none() {
@@ -5220,11 +5274,14 @@ impl App {
             },
             Cmd::VideoPage => {
                 if self.video_dlg.is_none() {
-                    let dir = self.settings.category_dir(Category::Video, &self.downloads);
-                    crate::videodlg::refresh_ytdlp(&self.rt);
+                    let dir = self
+                        .core
+                        .settings
+                        .category_dir(Category::Video, &self.core.downloads);
+                    crate::videodlg::refresh_ytdlp(&self.core.rt);
                     self.video_dlg = Some(
                         crate::videodlg::VideoDialog::new(dir)
-                            .with_subs(self.settings.video_subs.clone()),
+                            .with_subs(self.core.settings.video_subs.clone()),
                     );
                 }
             }
@@ -5234,7 +5291,7 @@ impl App {
             Cmd::ReportProblem => crate::help::report_problem(),
             Cmd::CheckUpdates => {
                 if self.updates.is_none() {
-                    self.updates = Some(crate::help::Updates::check(&self.rt, ctx));
+                    self.updates = Some(crate::help::Updates::check(&self.core.rt, ctx));
                 }
             }
             Cmd::About => self.about = Some(crate::help::About),
@@ -5247,7 +5304,7 @@ impl App {
             Cmd::TorrentSettings => {
                 if self.torrent_settings.is_none() {
                     self.torrent_settings =
-                        Some(crate::torrentdlg::TorrentSettings::new(&self.settings));
+                        Some(crate::torrentdlg::TorrentSettings::new(&self.core.settings));
                 }
             }
             Cmd::RssFeeds(rules) => {
@@ -5273,7 +5330,7 @@ impl App {
             Cmd::TorrentAddTrackers => {
                 let torrent = |i: &&Item| i.torrent.is_some();
                 if let Some(i) = target
-                    .and_then(|id| self.items.iter().find(|i| i.id == id))
+                    .and_then(|id| self.core.items.iter().find(|i| i.id == id))
                     .filter(torrent)
                 {
                     self.add_trackers =
@@ -5281,14 +5338,16 @@ impl App {
                 }
             }
             Cmd::TorrentFiles => {
-                if let Some(item) = target.and_then(|id| self.items.iter().find(|i| i.id == id)) {
+                if let Some(item) =
+                    target.and_then(|id| self.core.items.iter().find(|i| i.id == id))
+                {
                     self.torrent_files =
                         crate::torrentfiles::TorrentFiles::new(item, &self.torrent_host);
                 }
             }
             Cmd::TorrentCopyMagnet => {
                 // With its trackers, from the .torrent kept for it; else the list's address.
-                let found = target.and_then(|id| self.items.iter().find(|i| i.id == id));
+                let found = target.and_then(|id| self.core.items.iter().find(|i| i.id == id));
                 if let Some((spec, url)) = found.and_then(|i| i.torrent.as_ref().zip(Some(&i.url)))
                 {
                     let link =
@@ -5315,9 +5374,9 @@ impl App {
                 if self.options.is_none() {
                     self.options = Some(
                         crate::options::OptionsDialog::new(
-                            &self.settings,
-                            &self.downloads,
-                            self.host_limits.learned(),
+                            &self.core.settings,
+                            &self.core.downloads,
+                            self.core.host_limits.learned(),
                         )
                         .with_remote(self.remote.clone()),
                     );
@@ -5328,8 +5387,8 @@ impl App {
             Cmd::Scheduler => {
                 if self.scheduler.is_none() {
                     self.scheduler = Some(crate::scheduler::Scheduler::new(
-                        &self.queues,
-                        &self.settings,
+                        &self.core.queues,
+                        &self.core.settings,
                     ));
                 } else {
                     dialogs::raise(ctx, dialogs::dialog_viewport("scheduler"));
@@ -5337,7 +5396,7 @@ impl App {
             }
             Cmd::EditQueue(_) | Cmd::ScheduleQueue(_) | Cmd::NewQueue => {
                 let s = self.scheduler.get_or_insert_with(|| {
-                    crate::scheduler::Scheduler::new(&self.queues, &self.settings)
+                    crate::scheduler::Scheduler::new(&self.core.queues, &self.core.settings)
                 });
                 match cmd {
                     // Edit queue: its files; Schedule: when it runs.
@@ -5353,7 +5412,7 @@ impl App {
                 }
             }
             Cmd::CategoryProps(c) => {
-                let folder = self.settings.category_dir(c, &self.downloads);
+                let folder = self.core.settings.category_dir(c, &self.core.downloads);
                 self.category_dlg = Some(crate::categories::CategoryDialog::edit(c, &folder));
             }
             // The user's categories and the built-in ones by file type (#93); not General nor
@@ -5363,8 +5422,8 @@ impl App {
             }
             Cmd::DeleteCategory(_) => {}
             Cmd::ToggleDropTarget => {
-                self.settings.drop_target = !self.settings.drop_target;
-                self.dirty = true;
+                self.core.settings.drop_target = !self.core.settings.drop_target;
+                self.core.dirty = true;
             }
             Cmd::ShowMain => self.show_window(ctx),
             Cmd::Export { ef2 } => self.export(ef2),
@@ -5376,7 +5435,7 @@ impl App {
             Cmd::Redownload => {
                 if let Some(id) = target
                     && self.can_redownload(id)
-                    && let Some(item) = self.items.iter().find(|i| i.id == id)
+                    && let Some(item) = self.core.items.iter().find(|i| i.id == id)
                 {
                     let text = crate::i18n::fmt(
                         crate::i18n::t(
@@ -5397,8 +5456,8 @@ impl App {
                 }
             }
             Cmd::DeleteQueue(q) => {
-                if q >= 2 && q < self.queues.len() {
-                    let name = self.queues[q].name.clone();
+                if q >= 2 && q < self.core.queues.len() {
+                    let name = self.core.queues[q].name.clone();
                     self.confirm_queue_delete = Some((
                         q,
                         dialogs::Confirm::new(
@@ -5434,9 +5493,9 @@ impl App {
         let mut finished = Vec::new();
         let mut failed = Vec::new();
         let mut any_live = false;
-        for i in &mut self.items {
+        for i in &mut self.core.items {
             if i.poll() {
-                self.dirty = true;
+                self.core.dirty = true;
                 match i.status {
                     Status::Complete => finished.push(i.id),
                     Status::Error => failed.push(i.id),
@@ -5454,23 +5513,24 @@ impl App {
             self.sound(1);
         }
         for id in failed {
-            let e = self.failures.entry(id).or_insert((now, 0));
+            let e = self.core.failures.entry(id).or_insert((now, 0));
             *e = (now, e.1 + 1);
-            for q in &mut self.queues {
+            for q in &mut self.core.queues {
                 queue::requeue_failed(q, id);
             }
         }
         for id in &finished {
-            self.failures.remove(id);
+            self.core.failures.remove(id);
             // Its archive, when it is to be extracted and its last volume is in (#37).
-            self.extracts.finished(*id, &self.items, &self.settings);
+            self.extracts
+                .finished(*id, &self.core.items, &self.core.settings);
             // Finished files leave download queues (synchronization queues keep them).
-            for q in self.queues.iter_mut().filter(|q| !q.sync) {
+            for q in self.core.queues.iter_mut().filter(|q| !q.sync) {
                 q.items.retain(|x| x != id);
             }
         }
-        if self.extracts.poll(&mut self.items, ctx) {
-            self.dirty = true;
+        if self.extracts.poll(&mut self.core.items, ctx) {
+            self.core.dirty = true;
         }
         self.tick_queues();
         // A download started early behind Download File Info stays quiet until the dialog's
@@ -5488,9 +5548,9 @@ impl App {
             if Some(id) == early {
                 continue;
             }
-            if self.settings.show_complete
+            if self.core.settings.show_complete
                 && this_file
-                && let Some(i) = self.items.iter().find(|i| i.id == id)
+                && let Some(i) = self.core.items.iter().find(|i| i.id == id)
             {
                 self.complete.push(Complete {
                     id,
@@ -5508,9 +5568,7 @@ impl App {
             // The list's progress figures, every 30 s while something runs: after a crash the
             // rows show about where each download was (torrents keep their own resume data,
             // files their state file; this is only what the list shows).
-            if self.last_save.elapsed() > Duration::from_secs(30) {
-                self.dirty = true;
-            }
+            self.core.note_running(true);
         }
         // The keychain took a secret (#44): saved again, with its reference in its place.
         let vault = crate::secrets::vault();
@@ -5518,26 +5576,16 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
         let confirmed = vault.confirmed();
-        if confirmed != self.secrets_confirmed {
-            self.secrets_confirmed = confirmed;
-            self.dirty = true;
-        }
-        if self.dirty && self.last_save.elapsed() > Duration::from_secs(1) {
+        let _ = self.core.note_secrets(confirmed);
+        if self.core.dirty && self.core.last_save.elapsed() > Duration::from_secs(1) {
             // Written on the saver's thread (store::Saver); refused at once when the list
             // couldn't be read at start.
-            if let Err(e) = self.saver.save(
-                self.next_id,
-                &self.items,
-                &self.list.layout(),
-                &self.settings,
-                &self.queues,
-            ) {
-                self.report_save(Err(e.to_string()));
+            let columns = self.list.layout();
+            if let Err(e) = self.core.save(&columns) {
+                self.report_save(Err(e));
             }
-            self.dirty = false;
-            self.last_save = Instant::now();
         }
-        if let Some(outcome) = self.saver.outcome() {
+        if let Some(outcome) = self.core.take_save_outcome() {
             self.report_save(outcome);
         }
     }
@@ -5576,7 +5624,7 @@ impl App {
         let running = picked.iter().any(|i| i.live.is_some());
         let resumable = picked.iter().any(|i| i.can_start());
         let deletable = picked.iter().any(|i| i.live.is_none());
-        let any_running = self.items.iter().any(|i| i.live.is_some());
+        let any_running = self.core.items.iter().any(|i| i.live.is_some());
         let off = |label| I(label, Cmd::None, false, false);
         #[allow(unused_mut)]
         let mut menu = match index {
@@ -5607,13 +5655,13 @@ impl App {
                     "Show &drop target",
                     Cmd::ToggleDropTarget,
                     true,
-                    self.settings.drop_target,
+                    self.core.settings.drop_target,
                 ),
                 Sep,
                 // i18n: verb: save the download list to a file
                 Sub(
                     "E&xport",
-                    !self.items.is_empty(),
+                    !self.core.items.is_empty(),
                     vec![
                         I(
                             "To &IDM export file...",
@@ -5668,7 +5716,7 @@ impl App {
                 I(
                     "&Delete All Completed",
                     Cmd::DeleteCompleted,
-                    self.items.iter().any(|i| i.status == Status::Complete),
+                    self.core.items.iter().any(|i| i.status == Status::Complete),
                     false,
                 ),
                 Sep,
@@ -5693,13 +5741,13 @@ impl App {
                             "Turn o&n",
                             Cmd::LimiterOn,
                             true,
-                            self.settings.speed_limit_on,
+                            self.core.settings.speed_limit_on,
                         ),
                         I(
                             "Turn of&f",
                             Cmd::LimiterOff,
                             true,
-                            !self.settings.speed_limit_on,
+                            !self.core.settings.speed_limit_on,
                         ),
                         Sep,
                         I("S&ettings...", Cmd::LimiterSettings, true, false),
@@ -5728,7 +5776,7 @@ impl App {
                     "Dark Mode support",
                     Cmd::ToggleDarkMode,
                     true,
-                    self.settings.dark_mode_support,
+                    self.core.settings.dark_mode_support,
                 ),
                 // MDM's (#60): dark whatever the system says (a desktop that reports nothing).
                 I(
@@ -5736,7 +5784,7 @@ impl App {
                     "Always dark",
                     Cmd::ToggleAlwaysDark,
                     true,
-                    self.settings.always_dark,
+                    self.core.settings.always_dark,
                 ),
                 // i18n: noun: the list's font (submenu)
                 Sub("Font", false, vec![]),
@@ -5799,7 +5847,7 @@ impl App {
     /// to that folder. Picked, a theme applies at once.
     fn theme_menu(&self) -> MenuEntry<Cmd> {
         use MenuEntry::{Item as I, Radio, Sep, Sub};
-        let chosen = self.settings.theme.as_str();
+        let chosen = self.core.settings.theme.as_str();
         let mut items = Vec::new();
         let mut files = false;
         let on = |id: &str| chosen == id;
@@ -5877,7 +5925,7 @@ impl App {
         use crate::renderer::{self, Api, Why};
         use MenuEntry::{Item as I, Radio, Sep, Sub};
         let off = |label| I(label, Cmd::None, false, false);
-        let chosen = renderer::chosen(self.settings.renderer);
+        let chosen = renderer::chosen(self.core.settings.renderer);
         let gpu = renderer::GPU.unwrap_or(Api::OpenGl);
         let on = chosen == gpu;
         let draw = Cmd::DrawWith(gpu);
@@ -5954,13 +6002,13 @@ impl App {
                 // A name's "&" is text, not an access key (Tom & Jerry lost it).
                 &[(
                     "queue",
-                    &crate::i18n::t(&self.queues[q].name).replace('&', "&&"),
+                    &crate::i18n::t(&self.core.queues[q].name).replace('&', "&&"),
                 )],
             ))
         };
-        (0..self.queues.len())
+        (0..self.core.queues.len())
             .map(|q| {
-                let running = self.queues[q].running;
+                let running = self.core.queues[q].running;
                 if start {
                     MenuEntry::Item(label(q), Cmd::StartQueue(q), !running, false)
                 } else {
@@ -6022,7 +6070,7 @@ impl App {
             I(
                 "&Delete All Completed",
                 Cmd::DeleteCompleted,
-                self.items.iter().any(|i| i.status == Status::Complete),
+                self.core.items.iter().any(|i| i.status == Status::Complete),
                 false,
             ),
         ]
@@ -6046,11 +6094,13 @@ impl App {
         let all_done = any && chosen.iter().all(|i| i.status == Status::Complete);
         let queue_of = |q: &Queue| chosen.iter().all(|i| q.items.contains(&i.id)) && any;
         let in_queue = self
+            .core
             .queues
             .iter()
             .any(|q| chosen.iter().any(|i| q.items.contains(&i.id)));
         // The other queues they can go to; finished files only to synchronization queues.
         let targets: Vec<MenuEntry<Cmd>> = self
+            .core
             .queues
             .iter()
             .enumerate()
@@ -6065,7 +6115,7 @@ impl App {
             })
             .chain([I("Create new queue", Cmd::NewQueue, true, false)])
             .collect();
-        let open = self.settings.double_click_open;
+        let open = self.core.settings.double_click_open;
         // Several selected: enabled when one of them can go; the others are said to stay (#333).
         let movable = chosen.iter().any(|i| can_move(i));
         let redo = it.is_some_and(|i| self.can_redownload(i.id));
@@ -6236,7 +6286,7 @@ impl App {
                 ];
             }
         };
-        let running = queue.is_some_and(|q| self.queues[q].running);
+        let running = queue.is_some_and(|q| self.core.queues[q].running);
         vec![
             match queue {
                 Some(q) => I("Start now", Cmd::StartQueue(q), !running, false),
@@ -6359,7 +6409,7 @@ impl App {
         ));
         if self.queues_open {
             // Every queue, the user's too (IDM lists them all here).
-            for (q, queue) in self.queues.iter().enumerate() {
+            for (q, queue) in self.core.queues.iter().enumerate() {
                 let view = Some(View::Queue(q));
                 rows.push((
                     TreeRow {
@@ -6382,7 +6432,12 @@ impl App {
             if row.level == 0
                 && let Some(v) = view
             {
-                let n = self.items.iter().filter(|i| self.in_view(*v, i)).count();
+                let n = self
+                    .core
+                    .items
+                    .iter()
+                    .filter(|i| self.in_view(*v, i))
+                    .count();
                 row.count = (n > 0).then_some(n);
             }
         }
@@ -6626,8 +6681,8 @@ impl App {
         let running = picked.iter().any(|i| i.live.is_some());
         let resumable = picked.iter().any(|i| i.can_start());
         let deletable = picked.iter().any(|i| i.live.is_none());
-        let any_running = self.items.iter().any(|i| i.live.is_some());
-        let any_complete = self.items.iter().any(|i| i.status == Status::Complete);
+        let any_running = self.core.items.iter().any(|i| i.live.is_some());
+        let any_complete = self.core.items.iter().any(|i| i.status == Status::Complete);
         let buttons = [
             (Icon::AddUrl, "Add URL", true, Cmd::AddUrl),
             (Icon::AddTorrent, "Add Torrent", true, Cmd::OpenTorrentFile),
@@ -6652,13 +6707,13 @@ impl App {
                 Icon::StartQueue,
                 "Start Queue",
                 // The button acts on the main queue (the others: its arrow, the menus).
-                self.queues.first().is_some_and(|q| !q.running),
+                self.core.queues.first().is_some_and(|q| !q.running),
                 Cmd::StartQueue(0),
             ),
             (
                 Icon::StopQueue,
                 "Stop Queue",
-                self.queues.first().is_some_and(|q| q.running),
+                self.core.queues.first().is_some_and(|q| q.running),
                 Cmd::StopQueue(0),
             ),
         ];
@@ -6678,7 +6733,7 @@ impl App {
             let tree: Vec<TreeRow<'_>> = rows.iter().map(|(r, ..)| r.clone()).collect();
             // The splitter: the 4 px gap between the pane and the list, dragged sideways.
             let max_w = (w * 0.6).max(100.0);
-            let cat_w = (self.settings.categories_width as f32).clamp(100.0, max_w);
+            let cat_w = (self.core.settings.categories_width as f32).clamp(100.0, max_w);
             let right = o.x + 6.0 + cat_w;
             let split = winui::rect(egui::Rect::from_min_max(
                 pos2(right, o.y + chrome::MENU_H + chrome::pane_top()),
@@ -6700,10 +6755,10 @@ impl App {
                 let nw = (winui::mx(p.x) - o.x - 6.0 - 2.0)
                     .round()
                     .clamp(100.0, max_w);
-                self.settings.categories_width = nw as u32;
+                self.core.settings.categories_width = nw as u32;
             }
             if sr.drag_stopped() {
-                self.dirty = true;
+                self.core.dirty = true;
             }
             // The tree's keys while it has them (Tab moves between it and the list): Up / Down
             // through the nodes, Left / Right close and open a branch, Home / End.
@@ -6806,7 +6861,7 @@ impl App {
         }
         // The Status cell's tip, the download's recent events: made for the row under the
         // pointer only (twelve dated lines for every row, every frame, before).
-        let items = &self.items;
+        let items = &self.core.items;
         let tip = |i: usize| {
             ids.get(i)
                 .and_then(|id| items.iter().find(|it| it.id == *id))
@@ -6835,10 +6890,11 @@ impl App {
         if let Some(i) = r.double_clicked {
             let id = ids[i];
             let complete = self
+                .core
                 .items
                 .iter()
                 .any(|it| it.id == id && it.status == Status::Complete);
-            if complete && !self.settings.double_click_open {
+            if complete && !self.core.settings.double_click_open {
                 self.properties(id);
             } else {
                 self.open_item(id);
@@ -6868,7 +6924,7 @@ impl App {
         }
         let layout = self.list.layout();
         if self.last_layout.as_ref() != Some(&layout) {
-            self.dirty |= self.last_layout.is_some();
+            self.core.dirty |= self.last_layout.is_some();
             self.last_layout = Some(layout);
         }
         if let Some(pos) = r.header_context {
@@ -7023,13 +7079,13 @@ impl App {
             context,
             request,
             self.debrid_route(),
-            self.downloads.clone(),
-            self.settings.category_dirs.clone(),
-            &self.rt,
+            self.core.downloads.clone(),
+            self.core.settings.category_dirs.clone(),
+            &self.core.rt,
             ctx,
         );
-        fi.remember = self.settings.change_folder_on_last;
-        fi.folders = self.settings.folder_history.clone();
+        fi.remember = self.core.settings.change_folder_on_last;
+        fi.folders = self.core.settings.folder_history.clone();
         self.file_info = Some(fi);
     }
 
@@ -7040,7 +7096,7 @@ impl App {
         if std::mem::take(&mut self.duplicate_cleared) {
             return true;
         }
-        let Some((dup, name, gone)) = self.items.iter().find(|i| i.url == *url).map(|i| {
+        let Some((dup, name, gone)) = self.core.items.iter().find(|i| i.url == *url).map(|i| {
             (
                 i.id,
                 i.file_name.clone(),
@@ -7055,7 +7111,7 @@ impl App {
             self.overwrite(dup);
             return true;
         }
-        match self.settings.duplicate_action {
+        match self.core.settings.duplicate_action {
             1 => true,
             2 => {
                 self.overwrite(dup);
@@ -7108,7 +7164,7 @@ impl App {
     /// The new copy replaces the download already there: its file and its row go (a running
     /// one is left alone; the new copy then gets a numbered name).
     fn overwrite(&mut self, id: u64) {
-        let Some(item) = self.items.iter().find(|i| i.id == id) else {
+        let Some(item) = self.core.items.iter().find(|i| i.id == id) else {
             return;
         };
         if item.live.is_some() {
@@ -7125,7 +7181,7 @@ impl App {
 
     /// The download already there: its "Download complete" box when finished, else resumed.
     fn open_or_resume(&mut self, id: u64) {
-        let Some(i) = self.items.iter().find(|i| i.id == id) else {
+        let Some(i) = self.core.items.iter().find(|i| i.id == id) else {
             return;
         };
         self.selection.set(id);
@@ -7143,19 +7199,20 @@ impl App {
             self.start(id, true);
         } else if !self.progress.iter().any(|p| p.id == id) {
             self.progress
-                .push(Progress::new(id, self.settings.show_complete));
+                .push(Progress::new(id, self.core.settings.show_complete));
         }
     }
 
     /// Tasks → Show drop target: the box while it's on; what is dropped on it is added as if
     /// given on the command line (an address, a magnet link, a .torrent file).
     fn drop_target(&mut self, ctx: &egui::Context) {
-        if !self.settings.drop_target {
+        if !self.core.settings.drop_target {
             self.drop_target = None;
             return;
         }
         // First shown: beside the main window's top-right corner, on the same screen.
         let pos = self
+            .core
             .settings
             .drop_target_pos
             .map(|(x, y)| pos2(x as f32, y as f32))
@@ -7174,8 +7231,9 @@ impl App {
                 Event::ShowMain => self.show_window(ctx),
                 Event::Context(screen) => self.drop_target_menu(screen, ctx),
                 Event::Moved(p) => {
-                    self.settings.drop_target_pos = Some((p.x.round() as i32, p.y.round() as i32));
-                    self.dirty = true;
+                    self.core.settings.drop_target_pos =
+                        Some((p.x.round() as i32, p.y.round() as i32));
+                    self.core.dirty = true;
                 }
             }
         }
@@ -7215,9 +7273,9 @@ impl App {
     /// Tasks → Export, the file chosen: the addresses written to it.
     fn export_to(&mut self, path: &std::path::Path, ef2: bool) {
         let text = if ef2 {
-            crate::transfer::export_ef2(&self.items)
+            crate::transfer::export_ef2(&self.core.items)
         } else {
-            crate::transfer::export_text(&self.items)
+            crate::transfer::export_text(&self.core.items)
         };
         if let Err(e) = std::fs::write(path, text) {
             self.notice = Some((
@@ -7239,7 +7297,7 @@ impl App {
             ctx.set_language(Some(lang.to_owned()));
             self.a11y_lang = lang;
         }
-        let s = &mut self.settings;
+        let s = &mut self.core.settings;
         let pane = (
             self.show_categories,
             [
@@ -7252,7 +7310,7 @@ impl App {
         );
         if (s.show_categories, s.branches, s.view) != pane {
             (s.show_categories, s.branches, s.view) = pane;
-            self.dirty = true;
+            self.core.dirty = true;
         }
         // Not a test instance's off-screen window, nor one zoomed for screenshots (MDM_ZOOM).
         if crate::offscreen() || crate::scale::test_zoom().is_some() {
@@ -7272,7 +7330,7 @@ impl App {
             self.maximized = Some(m);
             if s.window_maximized != m {
                 s.window_maximized = m;
-                self.dirty = true;
+                self.core.dirty = true;
             }
         }
         if self.maximized == Some(false)
@@ -7286,7 +7344,7 @@ impl App {
             ];
             if s.window != Some(rect) {
                 s.window = Some(rect);
-                self.dirty = true;
+                self.core.dirty = true;
             }
         }
     }
@@ -7309,9 +7367,9 @@ impl App {
         // Saved whatever changed it, and kept when Options, opened before, hands back its copy
         // of the settings.
         let percent = crate::scale::of_zoom(zoom);
-        if crate::scale::test_zoom().is_none() && self.settings.interface_size != percent {
-            self.settings.interface_size = percent;
-            self.dirty = true;
+        if crate::scale::test_zoom().is_none() && self.core.settings.interface_size != percent {
+            self.core.settings.interface_size = percent;
+            self.core.dirty = true;
         }
         if settled {
             return true;
@@ -7321,9 +7379,9 @@ impl App {
         self.fitted = false;
         tracing::info!("interface size {percent}%");
         ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MIN));
-        if let Some((x, y)) = self.settings.drop_target_pos {
+        if let Some((x, y)) = self.core.settings.drop_target_pos {
             let at = |v: i32| (v as f32 * ratio).round() as i32;
-            self.settings.drop_target_pos = Some((at(x), at(y)));
+            self.core.settings.drop_target_pos = Some((at(x), at(y)));
         }
         if let Some(d) = &mut self.drop_target {
             d.rescale(ctx, ratio);
@@ -7531,8 +7589,8 @@ impl App {
     /// doubled).
     fn show_import(&mut self, found: Vec<crate::transfer::Imported>, source: String) {
         let known: std::collections::HashSet<String> =
-            self.items.iter().map(|i| i.url.to_string()).collect();
-        let (downloads, s) = (&self.downloads, &self.settings);
+            self.core.items.iter().map(|i| i.url.to_string()).collect();
+        let (downloads, s) = (&self.core.downloads, &self.core.settings);
         let grabber = self.grabber.get_or_insert_with(|| {
             crate::grabber::Grabber::new(
                 downloads.clone(),
@@ -7550,6 +7608,7 @@ impl App {
     fn add_grabbed(&mut self, start: bool, packages: Vec<crate::grabber::Picked>) {
         // Package numbers after those in the list.
         let last = self
+            .core
             .items
             .iter()
             .filter_map(|i| i.package.as_ref().map(|p| p.id))
@@ -7570,7 +7629,9 @@ impl App {
                 };
                 let category = Category::of(&name);
                 let dir = if pk.folder.as_os_str().is_empty() {
-                    self.settings.category_dir(category, &self.downloads)
+                    self.core
+                        .settings
+                        .category_dir(category, &self.core.downloads)
                 } else {
                     pk.folder.clone()
                 };
@@ -7592,18 +7653,18 @@ impl App {
                     context,
                     crate::i18n::mark("by Link grabber"),
                 );
-                if let Some(i) = self.items.iter_mut().find(|i| i.id == id) {
+                if let Some(i) = self.core.items.iter_mut().find(|i| i.id == id) {
                     i.package = Some(tag.clone());
                 }
                 // A name the server didn't give (none looked up) may still change.
                 if size.is_none() {
                     self.name_guessed(id, true);
                 }
-                self.queues[0].items.push(id);
+                self.core.queues[0].items.push(id);
                 added.push(id);
             }
         }
-        self.dirty = true;
+        self.core.dirty = true;
         // Start runs the main queue (its files at once, as Options → Queue sets).
         if start && !added.is_empty() {
             self.start_queue(0);
@@ -7613,7 +7674,7 @@ impl App {
     /// Link grabber's look-ups (Options → Archives → "Check links"): the next links, each
     /// with its own request (the page's referer and cookies), on the runtime.
     fn grabber_checks(&mut self, ctx: &egui::Context) {
-        if !self.settings.grabber_check {
+        if !self.core.settings.grabber_check {
             return;
         }
         let Some(g) = &self.grabber else { return };
@@ -7627,7 +7688,7 @@ impl App {
             let parts = self.request_parts(&url, None, &context, false);
             let slot: std::sync::Arc<std::sync::Mutex<Option<_>>> = Default::default();
             let (out, ctx) = (slot.clone(), ctx.clone());
-            self.rt.spawn(async move {
+            self.core.rt.spawn(async move {
                 let res = mdm_engine::probe(url, parts.headers, &parts.opts)
                     .await
                     .map_err(|e| crate::grabber::state_of(&e));
@@ -7643,7 +7704,8 @@ impl App {
     /// Can this download be fetched again from the start? A file download that isn't running
     /// (torrents re-check their data instead; a video's file is yt-dlp's to replace).
     fn can_redownload(&self, id: u64) -> bool {
-        self.items
+        self.core
+            .items
             .iter()
             .find(|i| i.id == id)
             .is_some_and(|i| i.live.is_none() && i.torrent.is_none() && i.video.is_none())
@@ -7662,14 +7724,14 @@ impl App {
         item.status = Status::Stopped;
         item.error = None;
         item.note(crate::i18n::t("Downloading again from the start"));
-        self.dirty = true;
+        self.core.dirty = true;
         self.start(id, true);
     }
 
     /// Move/Rename: a Save As box at the file's place; a finished file is moved there, one
     /// that hasn't started gets the new name and folder.
     fn move_rename(&mut self, id: u64) {
-        let Some(item) = self.items.iter().find(|i| i.id == id) else {
+        let Some(item) = self.core.items.iter().find(|i| i.id == id) else {
             return;
         };
         if !can_move(item) {
@@ -7699,7 +7761,7 @@ impl App {
     fn move_many(&mut self, ids: Vec<u64>) {
         let can = ids
             .iter()
-            .filter_map(|id| self.items.iter().find(|i| i.id == *id))
+            .filter_map(|id| self.core.items.iter().find(|i| i.id == *id))
             .find(|i| can_move(i));
         let Some(first) = can else {
             self.notice = Some(cant_move_notice());
@@ -7729,7 +7791,7 @@ impl App {
         let mut taken = std::collections::HashSet::new();
         let mut stay = false;
         for id in ids {
-            let Some(item) = self.items.iter().find(|i| i.id == id) else {
+            let Some(item) = self.core.items.iter().find(|i| i.id == id) else {
                 continue;
             };
             if !can_move(item) {
@@ -7742,7 +7804,7 @@ impl App {
             let target = place_in(&dir, &item.file_name, &mut taken);
             self.start_move(id, target);
         }
-        self.dirty = true;
+        self.core.dirty = true;
         if stay {
             self.notice = Some(cant_move_notice());
         }
@@ -7750,20 +7812,20 @@ impl App {
 
     /// Delete a queue of the user's (not the two built-in ones); its downloads stay in the list.
     fn delete_queue(&mut self, q: usize) {
-        if q < 2 || q >= self.queues.len() {
+        if q < 2 || q >= self.core.queues.len() {
             return;
         }
-        if self.queues[q].running {
+        if self.core.queues[q].running {
             self.stop_queue(q);
         }
-        self.queues.remove(q);
+        self.core.queues.remove(q);
         // The tree's selection follows the queues after it, and leaves the deleted one.
         self.view = match self.view {
             View::Queue(v) if v == q => View::All,
             View::Queue(v) if v > q => View::Queue(v - 1),
             v => v,
         };
-        self.dirty = true;
+        self.core.dirty = true;
     }
 
     /// IDM looks for a new version once a week; so do we (off: the switch in Check for updates). Found: the
@@ -7779,15 +7841,15 @@ impl App {
             .update_checked_this_run
             .is_some_and(|t| now - t >= crate::help::CHECK_EVERY);
         if self.auto_update.is_none()
-            && self.settings.update_check
+            && self.core.settings.update_check
             // Off-screen test runs check only when told where (MDM_UPDATE_FEED: their own feed).
             && (!crate::offscreen() || std::env::var_os("MDM_UPDATE_FEED").is_some())
             && (first || again)
         {
             self.update_checked_this_run = Some(now);
-            self.settings.update_checked = now;
-            self.dirty = true;
-            self.auto_update = Some(crate::help::check(&self.rt, ctx));
+            self.core.settings.update_checked = now;
+            self.core.dirty = true;
+            self.auto_update = Some(crate::help::check(&self.core.rt, ctx));
         }
         if self.updates.is_some() {
             if self.raise_updates && crate::dialogs::focus_when_shown(ctx, "updates") {
@@ -7804,7 +7866,7 @@ impl App {
             self.raise_options = false;
         }
         // Until the check at start is due.
-        if self.update_checked_this_run.is_none() && self.settings.update_check {
+        if self.update_checked_this_run.is_none() && self.core.settings.update_check {
             ctx.request_repaint_after(crate::help::CHECK_AFTER_START);
         }
         let done = self
@@ -7823,7 +7885,7 @@ impl App {
 
     fn help_dialogs(&mut self, ctx: &egui::Context) {
         if let Some(d) = &mut self.lang_picker {
-            let first = !self.settings.language_asked;
+            let first = !self.core.settings.language_asked;
             match d.show(ctx) {
                 Outcome::Open => {}
                 Outcome::Done(code) => {
@@ -7839,25 +7901,25 @@ impl App {
                     crate::theme::interface_fonts(ctx);
                     // Cancelled on the first start: Windows' language, and don't ask again.
                     if first {
-                        self.settings.language_asked = true;
-                        self.dirty = true;
+                        self.core.settings.language_asked = true;
+                        self.core.dirty = true;
                     }
                 }
             }
         }
         // Once the language is settled: the video helpers, offered once (helpers.rs).
         if self.lang_picker.is_none()
-            && self.settings.language_asked
-            && !self.settings.helpers_asked
+            && self.core.settings.language_asked
+            && !self.core.settings.helpers_asked
         {
-            self.settings.helpers_asked = true;
-            self.dirty = true;
+            self.core.settings.helpers_asked = true;
+            self.core.dirty = true;
             if crate::helpers::worth_asking() {
                 self.helpers = Some(crate::helpers::Helpers::new());
             }
         }
         if let Some(d) = &mut self.helpers
-            && !matches!(d.show(ctx, &self.rt), Outcome::Open)
+            && !matches!(d.show(ctx, &self.core.rt), Outcome::Open)
         {
             self.helpers = None;
         }
@@ -7869,11 +7931,11 @@ impl App {
         // Then the browser extension, once per start until a browser has it (extension.rs).
         if self.lang_picker.is_none()
             && self.helpers.is_none()
-            && self.settings.language_asked
+            && self.core.settings.language_asked
             && !self.extension_weighed
         {
             self.extension_weighed = true;
-            if crate::extension::worth_asking(&self.settings) {
+            if crate::extension::worth_asking(&self.core.settings) {
                 self.extension = Some(crate::extension::Extension::new());
             }
         }
@@ -7882,8 +7944,8 @@ impl App {
                 Outcome::Open => {}
                 Outcome::Done(()) => {
                     self.extension = None;
-                    self.settings.extension_never_ask = true;
-                    self.dirty = true;
+                    self.core.settings.extension_never_ask = true;
+                    self.core.dirty = true;
                 }
                 Outcome::Closed => self.extension = None,
             }
@@ -7893,10 +7955,10 @@ impl App {
         {
             self.about = None;
         }
-        let mut weekly = self.settings.update_check;
+        let mut weekly = self.core.settings.update_check;
         let mut close_for_update = false;
         if let Some(d) = &mut self.updates {
-            match d.show(ctx, &self.rt, &mut weekly) {
+            match d.show(ctx, &self.core.rt, &mut weekly) {
                 Outcome::Open => {}
                 // Update now: the new copy is going in place; MDM saves and closes for it.
                 Outcome::Done(true) => {
@@ -7909,9 +7971,9 @@ impl App {
         if close_for_update {
             self.run(Cmd::Exit, None, ctx);
         }
-        if weekly != self.settings.update_check {
-            self.settings.update_check = weekly;
-            self.dirty = true;
+        if weekly != self.core.settings.update_check {
+            self.core.settings.update_check = weekly;
+            self.core.dirty = true;
         }
         if let Some(d) = &mut self.shortcuts
             && !matches!(d.show(ctx), Outcome::Open)
@@ -7948,17 +8010,17 @@ impl App {
                 Outcome::Closed => self.queue_pick = None,
                 Outcome::Done((q, start)) => {
                     if let Some((ids, _)) = self.queue_pick.take()
-                        && q < self.queues.len()
+                        && q < self.core.queues.len()
                     {
                         for id in ids {
-                            if !self.queues[q].items.contains(&id) {
-                                self.queues[q].items.push(id);
+                            if !self.core.queues[q].items.contains(&id) {
+                                self.core.queues[q].items.push(id);
                             }
                         }
                         if start {
                             self.start_queue(q);
                         }
-                        self.dirty = true;
+                        self.core.dirty = true;
                     }
                 }
             }
@@ -7992,14 +8054,15 @@ impl App {
                 Outcome::Closed => self.category_dlg = None,
                 Outcome::Done(e) => {
                     self.category_dlg = None;
-                    let made = crate::categories::apply(&mut self.settings, e, &self.downloads);
+                    let made =
+                        crate::categories::apply(&mut self.core.settings, e, &self.core.downloads);
                     // Made with Download File Info's "+": that download goes in it.
                     if std::mem::take(&mut self.category_for_file_info)
                         && let Some(fi) = &mut self.file_info
                     {
                         fi.set_category(made);
                     }
-                    self.dirty = true;
+                    self.core.dirty = true;
                 }
             }
         }
@@ -8014,6 +8077,7 @@ impl App {
                     // move to General with the rest.
                     if remove {
                         let ids: Vec<u64> = self
+                            .core
                             .items
                             .iter()
                             .filter(|i| i.category == cat && i.live.is_none())
@@ -8021,14 +8085,14 @@ impl App {
                             .collect();
                         self.remove_downloads(&ids, false);
                     }
-                    crate::categories::delete(&mut self.settings, cat, &mut self.items);
+                    crate::categories::delete(&mut self.core.settings, cat, &mut self.core.items);
                     let gone = Some(cat);
                     if matches!(self.view, View::Cat(c) if Some(c) == gone)
                         || matches!(self.view, View::Unfinished(c) | View::Finished(c) if c == gone)
                     {
                         self.view = View::All;
                     }
-                    self.dirty = true;
+                    self.core.dirty = true;
                 }
             }
         }
@@ -8058,8 +8122,8 @@ impl App {
             let out = d.show(ctx);
             // Every address that goes on is remembered for the Address drop list.
             if let Outcome::Done(new) = &out {
-                crate::settings::remember(&mut self.settings.url_history, new.url.as_str());
-                self.dirty = true;
+                crate::settings::remember(&mut self.core.settings.url_history, new.url.as_str());
+                self.core.dirty = true;
             }
             match out {
                 Outcome::Open => {}
@@ -8086,23 +8150,27 @@ impl App {
                 // A video's page, not a file (YouTube, Vimeo…): the video window looks it up.
                 Outcome::Done(new) if mdm_tools::pages::is_video_page(&new.url) => {
                     self.add_url = None;
-                    let dir = self.settings.category_dir(Category::Video, &self.downloads);
-                    crate::videodlg::refresh_ytdlp(&self.rt);
+                    let dir = self
+                        .core
+                        .settings
+                        .category_dir(Category::Video, &self.core.downloads);
+                    crate::videodlg::refresh_ytdlp(&self.core.rt);
                     self.video_dlg = Some(
                         crate::videodlg::VideoDialog::for_page(
                             dir,
                             new.url.as_str(),
                             Default::default(),
                         )
-                        .with_subs(self.settings.video_subs.clone()),
+                        .with_subs(self.core.settings.video_subs.clone()),
                     );
                 }
                 // An image gallery's page (Wikimedia Commons, Flickr…): gallery-dl (#58).
                 Outcome::Done(new) if mdm_tools::pages::is_gallery_page(&new.url) => {
                     self.add_url = None;
                     let dir = self
+                        .core
                         .settings
-                        .category_dir(Category::General, &self.downloads);
+                        .category_dir(Category::General, &self.core.downloads);
                     self.gallery_dlg =
                         Some(crate::gallerydlg::GalleryDialog::new(dir, new.url.as_str()));
                 }
@@ -8130,12 +8198,12 @@ impl App {
                     self.confirm_delete = None;
                     self.remove_downloads(&ids, files);
                     if remember {
-                        self.settings.delete_files_too = files;
+                        self.core.settings.delete_files_too = files;
                     }
                     if dont_show {
-                        self.settings.confirm_delete = false;
+                        self.core.settings.confirm_delete = false;
                     }
-                    self.dirty = true;
+                    self.core.dirty = true;
                 }
             }
         }
@@ -8159,7 +8227,7 @@ impl App {
         }
         let mut changes = Vec::new();
         let mut files_requested = Vec::new();
-        let items = &self.items;
+        let items = &self.core.items;
         let icons = &mut self.icons;
         self.properties.retain_mut(|pr| {
             let Some(item) = items.iter().find(|i| i.id == pr.id) else {
@@ -8183,7 +8251,7 @@ impl App {
             self.apply_properties(c);
         }
         for id in files_requested {
-            if let Some(item) = self.items.iter().find(|i| i.id == id) {
+            if let Some(item) = self.core.items.iter().find(|i| i.id == id) {
                 self.torrent_files =
                     crate::torrentfiles::TorrentFiles::new(item, &self.torrent_host);
             }
@@ -8205,7 +8273,7 @@ impl App {
                     &[("algorithm", h.algo.name())],
                 ));
                 item.checksum = Some(h);
-                self.dirty = true;
+                self.core.dirty = true;
             }
         }
         if let Some(f) = &mut self.find {
@@ -8228,15 +8296,15 @@ impl App {
         if !self.torrents_started {
             self.torrents_started = true;
             // The handlers follow the exe (a portable copy may have moved).
-            if self.settings.torrent_associations {
+            if self.core.settings.torrent_associations {
                 #[cfg(windows)]
                 crate::win32::set_torrent_handlers(true);
                 #[cfg(unix)]
                 crate::unix::set_torrent_handlers(true);
             }
-            if self.settings.torrent_keep_sharing {
+            if self.core.settings.torrent_keep_sharing {
                 self.torrent_host.set_sharing(
-                    &self.rt,
+                    &self.core.rt,
                     self.session_hashes(),
                     self.complete_torrents(),
                     true,
@@ -8256,48 +8324,48 @@ impl App {
                 }) => {
                     self.torrent_settings = None;
                     // The network: the next torrent session takes it (torrent_tick).
-                    net.apply(&mut self.settings);
+                    net.apply(&mut self.core.settings);
                     // The upload limit: at once (torrent_tick sets it on the session).
                     (
-                        self.settings.torrent_upload_on,
-                        self.settings.torrent_upload_kb,
+                        self.core.settings.torrent_upload_on,
+                        self.core.settings.torrent_upload_kb,
                     ) = upload;
                     // Seeding limits: the tick stops those over them; raised, the finished
                     // torrents now under them are shared again (when sharing stays on).
-                    let s = &mut self.settings;
+                    let s = &mut self.core.settings;
                     let before = s.sharing_limits();
                     s.torrent_stop_ratio_on = seeding.ratio_on;
                     s.torrent_stop_ratio = seeding.ratio;
                     s.torrent_stop_minutes_on = seeding.minutes_on;
                     s.torrent_stop_minutes = seeding.minutes;
                     if share
-                        && share == self.settings.torrent_keep_sharing
-                        && before != self.settings.sharing_limits()
+                        && share == self.core.settings.torrent_keep_sharing
+                        && before != self.core.settings.sharing_limits()
                     {
                         self.torrent_host.set_sharing(
-                            &self.rt,
+                            &self.core.rt,
                             self.session_hashes(),
                             self.complete_torrents(),
                             true,
                         );
                     }
-                    if share != self.settings.torrent_keep_sharing {
-                        self.settings.torrent_keep_sharing = share;
+                    if share != self.core.settings.torrent_keep_sharing {
+                        self.core.settings.torrent_keep_sharing = share;
                         self.torrent_host.set_sharing(
-                            &self.rt,
+                            &self.core.rt,
                             self.session_hashes(),
                             self.complete_torrents(),
                             share,
                         );
                     }
-                    if assoc != self.settings.torrent_associations {
-                        self.settings.torrent_associations = assoc;
+                    if assoc != self.core.settings.torrent_associations {
+                        self.core.settings.torrent_associations = assoc;
                         #[cfg(windows)]
                         crate::win32::set_torrent_handlers(assoc);
                         #[cfg(unix)]
                         crate::unix::set_torrent_handlers(assoc);
                     }
-                    self.dirty = true;
+                    self.core.dirty = true;
                 }
             }
         }
@@ -8361,7 +8429,7 @@ impl App {
             self.choose_files(id, files, all, size);
         }
         if let Some(t) = &mut self.torrent_dlg {
-            match t.show(ctx, &self.rt) {
+            match t.show(ctx, &self.core.rt) {
                 Outcome::Open => {}
                 Outcome::Closed => self.torrent_dlg = None,
                 Outcome::Done(add) => {
@@ -8371,7 +8439,7 @@ impl App {
             }
         }
         if let Some(g) = &mut self.gallery_dlg {
-            match g.show(ctx, &self.rt) {
+            match g.show(ctx, &self.core.rt) {
                 Outcome::Open => {}
                 Outcome::Closed => self.gallery_dlg = None,
                 Outcome::Done(add) => {
@@ -8381,7 +8449,7 @@ impl App {
             }
         }
         if let Some(v) = &mut self.video_dlg {
-            match v.show(ctx, &self.rt) {
+            match v.show(ctx, &self.core.rt) {
                 Outcome::Open => {}
                 Outcome::Closed => self.video_dlg = None,
                 Outcome::Done(out) => {
@@ -8404,19 +8472,19 @@ impl App {
             }
         }
         if let Some(d) = &mut self.options {
-            match d.show(ctx, &self.downloads) {
+            match d.show(ctx, &self.core.downloads) {
                 Outcome::Open => {}
                 Outcome::Closed => {
                     // Cancel: categories the dialog added, changed or restored are undone, and
                     // the remote control listens as before Pair a device... moved it.
-                    self.settings.publish_categories();
+                    self.core.settings.publish_categories();
                     if let Some(r) = &self.remote {
-                        r.apply(crate::remote::config(&self.settings));
+                        r.apply(crate::remote::config(&self.core.settings));
                     }
                     self.options = None;
                 }
                 Outcome::Done(new) => {
-                    let new = Settings::merge_changes(&self.settings, &d.from, &new);
+                    let new = Settings::merge_changes(&self.core.settings, &d.from, &new);
                     self.options = None;
                     self.apply_options(new);
                 }
@@ -8427,9 +8495,9 @@ impl App {
             let open = s.show(
                 ctx,
                 &mut self.icons,
-                &self.items,
-                &self.queues,
-                self.wake.error.as_deref(),
+                &self.core.items,
+                &self.core.queues,
+                self.core.wake.error.as_deref(),
                 &mut actions,
             );
             for a in actions {
@@ -8444,14 +8512,14 @@ impl App {
                 Outcome::Open => {}
                 Outcome::Closed => self.speed_settings = None,
                 Outcome::Done(c) => {
-                    self.settings.speed_limit_kb = c.kb;
-                    self.settings.limiter_on_startup = c.on_startup;
-                    self.settings.global_limit_on = c.global_on;
-                    self.settings.global_limit_kb = c.global_kb;
-                    self.settings.global_only_active = c.only_active;
+                    self.core.settings.speed_limit_kb = c.kb;
+                    self.core.settings.limiter_on_startup = c.on_startup;
+                    self.core.settings.global_limit_on = c.global_on;
+                    self.core.settings.global_limit_kb = c.global_kb;
+                    self.core.settings.global_only_active = c.only_active;
                     self.speed_settings = None;
                     self.apply_speed_limit();
-                    self.dirty = true;
+                    self.core.dirty = true;
                 }
             }
         }
@@ -8467,10 +8535,10 @@ impl App {
                 && let Some(dir) = fi.dest().parent()
             {
                 crate::settings::remember(
-                    &mut self.settings.folder_history,
+                    &mut self.core.settings.folder_history,
                     &dir.display().to_string(),
                 );
-                self.dirty = true;
+                self.core.dirty = true;
             }
             // The address was edited after the early start, or "Download through" changed (#44):
             // that download is the old one's. It goes; the new one starts early in its turn
@@ -8511,18 +8579,18 @@ impl App {
         // (the captures and the accessibility checks see the hide button).
         let tray = (self.tray.is_some() || crate::offscreen()) && crate::tray::available();
         for p in &mut self.progress {
-            p.keep_sharing = self.settings.torrent_keep_sharing;
+            p.keep_sharing = self.core.settings.torrent_keep_sharing;
             if p.host.is_none() {
                 p.host = Some(self.torrent_host.clone());
             }
             p.tray = tray;
-            p.minimize_to_tray = self.settings.minimize_to_tray;
+            p.minimize_to_tray = self.core.settings.minimize_to_tray;
             // Hidden: not shown (its window is gone) until the tray or the list brings it back.
             if p.hidden && tray {
                 continue;
             }
             p.hidden = false;
-            if let Some(item) = self.items.iter().find(|i| i.id == p.id) {
+            if let Some(item) = self.core.items.iter().find(|i| i.id == p.id) {
                 actions.push((p.id, p.show(ctx, item, item.snap.as_ref())));
             }
         }
@@ -8548,7 +8616,7 @@ impl App {
                         }
                         // Remembered, it applies again after a stop or a restart.
                         item.own_limit = if remember { limit } else { None };
-                        self.dirty = true;
+                        self.core.dirty = true;
                     }
                 }
                 progress::Action::UploadLimit(limit) => {
@@ -8563,7 +8631,7 @@ impl App {
                         {
                             run.set_upload_limit(limit);
                         }
-                        self.dirty = true;
+                        self.core.dirty = true;
                     }
                 }
                 progress::Action::Choose { files, all, size } => {
@@ -8577,8 +8645,8 @@ impl App {
                 Outcome::Open => keep.push(c),
                 Outcome::Done(()) | Outcome::Closed => {
                     if c.dont_show {
-                        self.settings.show_complete = false;
-                        self.dirty = true;
+                        self.core.settings.show_complete = false;
+                        self.core.dirty = true;
                     }
                 }
             }
@@ -8628,9 +8696,9 @@ impl App {
         // runs no `ui`, and the queues, the Scheduler's starts and stops, the download limits,
         // the kill switch, saving the list, the clipboard monitor, the update check, the tray and
         // the taskbar's progress all stood still until the window was restored.
-        crate::settings::share_proxy(self.settings.proxy());
-        crate::settings::share_dns(self.settings.dns());
-        crate::settings::share_video_cookies(&self.settings);
+        crate::settings::share_proxy(self.core.settings.proxy());
+        crate::settings::share_dns(self.core.settings.dns());
+        crate::settings::share_video_cookies(&self.core.settings);
         if !self.headless {
             self.follow_assistive_technology(ctx);
         }
@@ -8659,9 +8727,9 @@ impl App {
             self.ticked = Some(Instant::now());
             // For a crash report: what MDM has open and running (sent when it changes).
             crate::crash::state(
-                self.items.len(),
-                self.items.iter().filter(|i| i.live.is_some()).count(),
-                self.queues.len(),
+                self.core.items.len(),
+                self.core.items.iter().filter(|i| i.live.is_some()).count(),
+                self.core.queues.len(),
                 ctx.pixels_per_point(),
             );
             self.torrent_tick();
@@ -8721,8 +8789,8 @@ impl App {
                 self.theme_list = crate::themefile::list();
             }
             let changed = crate::theme::update(
-                self.settings.dark_mode_support,
-                self.settings.always_dark,
+                self.core.settings.dark_mode_support,
+                self.core.settings.always_dark,
                 &ctx,
             );
             // Native follows the system's accent and contrast as they change, a theme made from
@@ -8802,7 +8870,10 @@ impl App {
                 .unwrap_or_else(|| mdm_engine::naming::file_name(None, &url));
             let name = mdm_engine::naming::sanitize(&name);
             let category = Category::of(&name);
-            let dir = self.settings.category_dir(category, &self.downloads);
+            let dir = self
+                .core
+                .settings
+                .category_dir(category, &self.core.downloads);
             let dest = mdm_engine::naming::destination(&dir, &name);
             let size = context.size;
             let id = self.push_item(
@@ -8816,7 +8887,7 @@ impl App {
                 crate::i18n::mark("from the browser"),
             );
             self.name_guessed(id, guessed);
-            self.queues[0].items.push(id);
+            self.core.queues[0].items.push(id);
         }
         // The channel's receiver goes with it: later commands are answered "gone".
         self.commands = std::sync::mpsc::channel().1;
@@ -8828,17 +8899,12 @@ impl Drop for App {
         // An archive being extracted stops; its staging folder goes with it.
         self.extracts.stop();
         // No wake for a queue MDM won't be there to start (Linux's alarm would outlive it).
-        self.wake.clear();
+        self.core.wake.clear();
         self.keep_unseen();
         // What the saver has in hand first, then the last state, written here and now.
-        self.saver.flush();
-        let _ = store::save(
-            self.next_id,
-            &self.items,
-            &self.list.layout(),
-            &self.settings,
-            &self.queues,
-        );
+        self.core.saver.flush();
+        let columns = self.list.layout();
+        let _ = self.core.save(&columns);
     }
 }
 

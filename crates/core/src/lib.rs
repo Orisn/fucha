@@ -15,6 +15,7 @@ pub mod quota;
 pub mod regional;
 pub mod rss;
 pub mod secrets;
+pub mod session;
 pub mod settings;
 pub mod store;
 pub mod torrent;
